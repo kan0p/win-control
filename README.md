@@ -103,6 +103,13 @@ CPU y RAM se leen del cgroup del contenedor (`/sys/fs/cgroup`), sin `docker stat
 
 `win` no muestra notificaciones de progreso: el avance se ve en la ScreenPad. Solo un error al abrir desde el menú o desde un archivo aparece unos segundos como notificación.
 
+## Avisos
+
+- Necesitas tus propias licencias de Windows y de Microsoft 365. Este proyecto no incluye, descarga ni activa ninguna licencia; Office se activa iniciando sesión con tu cuenta.
+- Microsoft, Windows, Office, Word, Excel y PowerPoint son marcas de Microsoft. Este proyecto no está afiliado a Microsoft.
+- [WinApps](https://github.com/winapps-org/winapps) y [dockur/windows](https://github.com/dockur/windows) tienen sus propias licencias; este repositorio no incluye su código.
+- [Thincast Remote Desktop Client](https://www.thincast.com/en/products/client) es software de terceros con sus propios términos de uso.
+
 ## Licencia
 
 GPL-3.0-or-later. Ver [LICENSE](LICENSE).
