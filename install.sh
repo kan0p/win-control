@@ -32,20 +32,14 @@ if [ "${1:-}" = "--desinstalar" ]; then
 fi
 
 command -v docker >/dev/null || { echo "Falta docker." >&2; exit 1; }
-[ -x "$BIN/winapps" ] || { echo "Falta WinApps en $BIN/winapps." >&2; exit 1; }
+[ -f "$HOME/.config/winapps/winapps.conf" ] || { echo "Falta ~/.config/winapps/winapps.conf (usa instalar-todo.sh)." >&2; exit 1; }
 
 mkdir -p "$BIN"
 ln -sfn "$DIR/win" "$BIN/win"
 echo "win -> $BIN/win"
 
-# los accesos del menú pasan por win para encender Windows antes de abrir la app
-for a in "${APPS[@]}"; do
-    f="$ESCRITORIO/$a.desktop"
-    if [ -f "$f" ]; then
-        sed -i "s|^Exec=.*/winapps $a |Exec=$BIN/win $a |" "$f"
-        echo "menú: $a usa win"
-    fi
-done
+# accesos del menú de las apps elegidas (win-<app>.desktop)
+"$BIN/win" _accesos && echo "menú: accesos de las apps elegidas"
 
 f="$ESCRITORIO/windows.desktop"
 if [ -f "$f" ]; then

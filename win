@@ -8,7 +8,6 @@ IP_INVITADO="172.30.0.2"
 ESPERA_MAX=240
 ESPERA_CIERRE=60        # s para que las apps se cierren solas antes de apagar
 LATIDO_MAX=15           # s sin noticias del agente para darlo por colgado
-WINAPPS="$HOME/.local/bin/winapps"
 DATOS="$HOME/.local/share/winapps"
 CONF="$HOME/.config/winapps/win.conf"
 ESTADO_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/win"
@@ -18,7 +17,7 @@ CERROJO_CONEXION="$ESTADO_DIR/conexion.lock"
 CERROJO_ORDEN="$ESTADO_DIR/orden.lock"
 ORDEN_ACTUAL="$ESTADO_DIR/orden"
 ESCALAR="$ESTADO_DIR/forzar"
-ICONO="$DATOS/apps/windows/icon.svg"
+ICONO="$(dirname "$(realpath "$0")")/glasspad/windows/icono.svg"
 COLA="$ESTADO_DIR/cola"
 ABIERTAS="$ESTADO_DIR/abiertas.txt"
 FIN_SESION="$ESTADO_DIR/fin.txt"
@@ -44,13 +43,49 @@ mkdir -p "$ESTADO_DIR"
 AUTO_APAGADO=0
 CLIENTE_RDP=freerdp     # freerdp | thincast (solo para las apps sueltas)
 THINCAST="com.thincast.client"
+APPS_ELEGIDAS="word excel ppt"          # apps del catálogo con acceso en el menú y la ScreenPad
+OFFICE_APPS="Word Excel PowerPoint"      # apps de Office instaladas en Windows
+OFFICE_PRODUCTO="O365BusinessRetail"     # O365ProPlusRetail para E3/E5/A3/A5
 # shellcheck disable=SC1090
 [ -f "$CONF" ] && . "$CONF"
 
-declare -A APPS=(
-    [excel]=excel-o365 [word]=word-o365 [ppt]=powerpoint-o365 [powerpoint]=powerpoint-o365
-    [excel-o365]=excel-o365 [word-o365]=word-o365 [powerpoint-o365]=powerpoint-o365
-)
+CATALOGO="$RAIZ/apps.conf"
+OFFICE_PS1="$RAIZ/windows/office.ps1"
+ICONOS_DIR="$HOME/.local/share/win/iconos"
+ACCESOS="$HOME/.local/share/applications"
+
+# ----- catálogo de apps (apps.conf) -------------------------------------------------
+
+catalogo() {
+    sed -e 's/#.*//' -e 's/[[:space:]]*|[[:space:]]*/|/g' -e 's/^[[:space:]]*//' \
+        -e 's/[[:space:]]*$//' "$CATALOGO" | grep '|'
+}
+
+app_dato() { catalogo | awk -F'|' -v c="$1" -v n="$2" '$1 == c { print $n; exit }'; }
+
+# nombres antiguos de WinApps -> clave del catálogo
+app_clave() {
+    case "$1" in
+        word-o365) echo word ;; excel-o365) echo excel ;; powerpoint|powerpoint-o365) echo ppt ;;
+        *) echo "$1" ;;
+    esac
+}
+
+app_proceso() { local e; e="$(app_dato "$1" 4)"; e="${e##*\\}"; e="${e%.*}"; echo "${e^^}"; }
+
+app_icono() {
+    local i; i="$(app_dato "$1" 6)"
+    if [ -f "$ICONOS_DIR/$1.svg" ]; then echo "$ICONOS_DIR/$1.svg"
+    elif [ -f "$DATOS/apps/$i/icon.svg" ]; then echo "$DATOS/apps/$i/icon.svg"
+    else echo "$i"; fi
+}
+
+# guarda CLAVE=valor en win.conf
+poner_conf() {
+    touch "$CONF"
+    if grep -q "^$1=" "$CONF"; then sed -i "s|^$1=.*|$1=\"$2\"|" "$CONF"
+    else echo "$1=\"$2\"" >>"$CONF"; fi
+}
 
 en_terminal() { [ -t 1 ]; }
 
@@ -89,16 +124,28 @@ notificar_app() {
 
 # títulos de las ventanas visibles de la sesión: "Libro1 - Excel", "Word"…
 # con Thincast en Wayland las ventanas no son de X11: los títulos los informa el agente
-ventanas() {
+# "PROCESO|título" por ventana (con FreeRDP el proceso va vacío: se leen de X11)
+ventanas_proc() {
     if [ "$CLIENTE_RDP" = thincast ]; then
-        conexion_viva && [ -f "$ABIERTAS" ] && sed -n 's/^\xEF\xBB\xBF//; s/\r$//; s/^v|//p' "$ABIERTAS"
+        conexion_viva && [ -f "$ABIERTAS" ] &&
+            sed -n 's/^\xEF\xBB\xBF//; s/\r$//; s/^v|//p' "$ABIERTAS" | awk -F'|' 'NF >= 2 { print } NF == 1 { print "|" $0 }'
         return 0
     fi
-    python3 -I "$VENTANAS" 2>/dev/null
+    python3 -I "$VENTANAS" 2>/dev/null | sed 's/^/|/'
 }
 
-# "Word", "Documento1 - Word" o "Microsoft Word" (mientras arranca)
-contar_ventanas() { ventanas | grep -cE "(^| )$1\$"; }
+ventanas() { ventanas_proc | cut -d'|' -f2-; }
+
+# ventanas de una app: por proceso si se sabe; si no, por título ("Documento1 - Word",
+# "Microsoft Word" mientras arranca)
+contar_ventanas() {
+    local nombre="$1" proc="${2:-}"
+    if [ -n "$proc" ] && ventanas_proc | grep -q '^[^|]'; then
+        ventanas_proc | grep -c "^$proc|"
+    else
+        ventanas | grep -cE "(^| )$nombre\$"
+    fi
+}
 
 esperar() { sleep "$1"; }
 
@@ -318,6 +365,7 @@ lanzar_conexion() {
     . "$HOME/.config/winapps/winapps.conf"
     mkdir -p "$COLA"
     cmp -s "$AGENTE" "$AGENTE_LOCAL" || cp "$AGENTE" "$AGENTE_LOCAL"
+    cmp -s "$OFFICE_PS1" "$ESTADO_DIR/office.ps1" || cp "$OFFICE_PS1" "$ESTADO_DIR/office.ps1"
     rm -f "$ABIERTAS"
     [ -f "$REGISTRO_RDP" ] && mv -f "$REGISTRO_RDP" "$ESTADO_DIR/freerdp.anterior.log"
     export REGISTRO_RDP
@@ -521,19 +569,17 @@ reparar() {
 }
 
 abrir() {
-    local app="$1" archivo="" exe nombre WIN_EXECUTABLE="" FULL_NAME=""
+    local clave="$1" archivo="" exe nombre proc
     shift
-    local info="$DATOS/apps/$app/info"
-    [ -f "$info" ] || error "WinApps no tiene configurada la app $app."
-    # shellcheck disable=SC1090
-    . "$info"
-    exe="$WIN_EXECUTABLE"; nombre="${FULL_NAME#Microsoft }"
+    exe="$(app_dato "$clave" 4)"; nombre="$(app_dato "$clave" 2)"; proc="$(app_proceso "$clave")"
+    [ -n "$exe" ] || error "No conozco la app $clave (mira: win apps-disponibles)."
     if [ $# -gt 0 ] && [ -n "$1" ]; then
         [ $# -gt 1 ] && avisar "Se abre solo el primer archivo; los demás ábrelos desde $nombre."
         archivo="$(ruta_windows "$1")" || error "Windows solo ve archivos dentro de tu carpeta personal: copia el archivo ahí primero."
     fi
-    local icono="$DATOS/apps/$app/icon.svg" base limite=60
-    base="$(contar_ventanas "$nombre")"
+    local icono base limite=60
+    icono="$(app_icono "$clave")"
+    base="$(contar_ventanas "$nombre" "$proc")"
     NOTIF_ICONO="$icono"
     if ! en_terminal; then
         QUIETO=1
@@ -550,7 +596,7 @@ abrir() {
         error "El agente de Windows no responde. Usa: win reparar"
     fi
     pedir abrir "$exe" "$nombre" "$archivo"
-    setsid -f "$0" _vigilar "$nombre" "$base" "$limite" "${NOTIF_ID:-}" "$icono" \
+    setsid -f "$0" _vigilar "$nombre" "$base" "$limite" "${NOTIF_ID:-}" "$icono" "$proc" \
         </dev/null >/dev/null 2>&1 7>&- 8>&- 9>&-
     conexion_viva || { asegurar_conexion; return 0; }
     # el agente podría estar cerrando la sesión justo ahora: si nadie toma el pedido, reconectar
@@ -564,12 +610,12 @@ abrir() {
 
 # espera a que aparezca una ventana nueva de la app y actualiza la notificación
 vigilar() {
-    local nombre="$1" base="$2" limite="$3" icono="$5" t=0
+    local nombre="$1" base="$2" limite="$3" icono="$5" proc="${6:-}" t=0
     NOTIF_ID="$4"
     while [ "$t" -lt "$limite" ]; do
         sleep 1; t=$((t + 1))
         # con la app ya abierta, Office puede reutilizar su ventana en vez de abrir otra
-        if [ "$(contar_ventanas "$nombre")" -gt "$base" ] || { [ "$base" -gt 0 ] && [ "$t" -ge 6 ]; }; then
+        if [ "$(contar_ventanas "$nombre" "$proc")" -gt "$base" ] || { [ "$base" -gt 0 ] && [ "$t" -ge 6 ]; }; then
             registrar "$nombre lista tras ${t} s"
             notificar_app "$icono" "$nombre está listo." 3000
             return 0
@@ -644,7 +690,7 @@ mostrar_estado() {
 
 # salida para el complemento de GlassPad:
 #   "<estado> <ram_mib> <apps> <auto_min> <agente_ok> <cpu_%>", una línea "PROCESO|nombre" por app
-#   y una línea "ventana|título" por ventana visible
+#   y una línea "ventana|PROCESO|título" por ventana visible (PROCESO vacío con FreeRDP)
 estado_corto() {
     local e apps ram=0 cpu=0 ok=1; e="$(estado)"; apps="$(lista_apps)"
     case "$e" in encendido|arrancando|pausado|apagando|reiniciando)
@@ -652,7 +698,7 @@ estado_corto() {
     conexion_viva && [ -f "$ABIERTAS" ] && ! agente_responde && ok=0
     echo "$e ${ram:-0} $(grep -c . <<<"$apps") $AUTO_APAGADO $ok ${cpu:-0}"
     [ -n "$apps" ] && echo "$apps"
-    conexion_viva && ventanas | sed 's/^/ventana|/'
+    conexion_viva && ventanas_proc | sed 's/^/ventana|/'
     return 0
 }
 
@@ -739,6 +785,114 @@ elegir_cliente() {
     avisar "Cliente para las apps sueltas: $c"
 }
 
+# ----- apps elegidas: accesos del menú y de la ScreenPad ---------------------------
+
+tipos_mime() {
+    case "$1" in
+        word) echo "application/msword;application/vnd.openxmlformats-officedocument.wordprocessingml.document;application/vnd.openxmlformats-officedocument.wordprocessingml.template;application/vnd.ms-word.document.macroEnabled.12;application/rtf;" ;;
+        excel) echo "application/vnd.ms-excel;application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;application/vnd.openxmlformats-officedocument.spreadsheetml.template;application/vnd.ms-excel.sheet.macroEnabled.12;application/vnd.ms-excel.sheet.binary.macroEnabled.12;" ;;
+        ppt) echo "application/vnd.ms-powerpoint;application/vnd.openxmlformats-officedocument.presentationml.presentation;application/vnd.openxmlformats-officedocument.presentationml.slideshow;application/vnd.ms-powerpoint.presentation.macroEnabled.12;" ;;
+    esac
+}
+
+crear_acceso() {
+    local clave="$1" nombre grupo mime f
+    nombre="$(app_dato "$clave" 2)"; grupo="$(app_dato "$clave" 3)"; mime="$(tipos_mime "$clave")"
+    f="$ACCESOS/win-$clave.desktop"
+    mkdir -p "$ACCESOS"
+    {
+        echo "[Desktop Entry]"
+        echo "Type=Application"
+        echo "Name=$nombre"
+        echo "Comment=$nombre (Windows)"
+        echo "Exec=$HOME/.local/bin/win $clave %F"
+        echo "Icon=$(app_icono "$clave")"
+        echo "Terminal=false"
+        [ "$grupo" = office ] && echo "Categories=Office;" || echo "Categories=Utility;"
+        [ -n "$mime" ] && echo "MimeType=$mime"
+    } >"$f"
+    if [ -n "$mime" ] && command -v xdg-mime >/dev/null; then
+        tr ';' '\n' <<<"$mime" | grep . | xargs -r xdg-mime default "win-$clave.desktop" 2>/dev/null
+    fi
+}
+
+# rehace los accesos de las apps elegidas y quita los de WinApps que ya apuntaban a win
+accesos() {
+    local clave viejo
+    for viejo in word-o365 excel-o365 powerpoint-o365; do
+        grep -qs "/bin/win " "$ACCESOS/$viejo.desktop" && rm -f "$ACCESOS/$viejo.desktop"
+    done
+    for clave in $APPS_ELEGIDAS; do
+        [ -n "$(app_dato "$clave" 4)" ] && crear_acceso "$clave"
+    done
+    command -v update-desktop-database >/dev/null && update-desktop-database "$ACCESOS" 2>/dev/null
+    return 0
+}
+
+apps_disponibles() {
+    local clave nombre grupo marca
+    while IFS='|' read -r clave nombre grupo _; do
+        marca="[ ]"; [[ " $APPS_ELEGIDAS " == *" $clave "* ]] && marca="[x]"
+        printf '  %s %-12s %-20s %s\n' "$marca" "$clave" "$nombre" \
+            "$([ "$grupo" = office ] && echo "Office" || echo "Windows")"
+    done < <(catalogo)
+    echo
+    echo "Agregar: win agregar-app <clave>…   Quitar: win quitar-app <clave>…"
+}
+
+agregar_app() {
+    [ $# -gt 0 ] || { apps_disponibles; return; }
+    local clave nuevas="$APPS_ELEGIDAS" office_nuevas="" id
+    for clave in "$@"; do
+        clave="$(app_clave "$clave")"
+        [ -n "$(app_dato "$clave" 4)" ] || error "No conozco la app $clave (mira: win apps-disponibles)."
+        [[ " $nuevas " == *" $clave "* ]] || nuevas="$nuevas $clave"
+        id="$(app_dato "$clave" 5)"
+        if [ "$(app_dato "$clave" 3)" = office ] && [[ " $OFFICE_APPS " != *" $id "* ]]; then
+            office_nuevas="$office_nuevas $id"
+        fi
+    done
+    APPS_ELEGIDAS="$(echo $nuevas)"
+    poner_conf APPS_ELEGIDAS "$APPS_ELEGIDAS"
+    accesos
+    avisar "Apps en el menú y la ScreenPad: $APPS_ELEGIDAS"
+    if [ -n "$office_nuevas" ]; then
+        instalar_office "$(echo $OFFICE_APPS $office_nuevas)"
+    fi
+}
+
+quitar_app() {
+    local clave nuevas=" $APPS_ELEGIDAS "
+    for clave in "$@"; do
+        clave="$(app_clave "$clave")"
+        nuevas="${nuevas// $clave / }"
+        rm -f "$ACCESOS/win-$clave.desktop"
+    done
+    APPS_ELEGIDAS="$(echo $nuevas)"
+    poner_conf APPS_ELEGIDAS "$APPS_ELEGIDAS"
+    accesos
+    avisar "Apps en el menú y la ScreenPad: $APPS_ELEGIDAS (en Windows siguen instaladas)"
+}
+
+# instala en Windows las apps de Office indicadas (las demás quedan excluidas)
+instalar_office() {
+    local apps="$1"
+    encender || exit 1
+    asegurar_conexion || exit 1
+    pedir office "$apps" "$OFFICE_PRODUCTO"
+    poner_conf OFFICE_APPS "$apps"
+    avisar "Instalando Office en Windows ($apps). Acepta el aviso de permisos de Windows; tarda varios minutos. El resultado queda en ~/.local/state/win/office.txt"
+}
+
+# lista para el Lanzador de la ScreenPad: "clave|nombre|ícono|PROCESO"
+lanzador() {
+    local clave
+    for clave in $APPS_ELEGIDAS; do
+        [ -n "$(app_dato "$clave" 4)" ] || continue
+        echo "$clave|$(app_dato "$clave" 2)|$(app_icono "$clave")|$(app_proceso "$clave")"
+    done
+}
+
 ayuda() {
     cat <<'EOF'
 Uso: win <comando>
@@ -767,7 +921,7 @@ EOF
 }
 
 cmd="${1:-status}"; shift 2>/dev/null || true
-case "$cmd" in _corto|_ventanas|_revisar|status|estado|apps|log|help|-h|--help|ayuda) ;; *) registrar "orden: $cmd $*" ;; esac
+case "$cmd" in _corto|_ventanas|_lanzador|_revisar|status|estado|apps|apps-disponibles|log|help|-h|--help|ayuda) ;; *) registrar "orden: $cmd $*" ;; esac
 case "$cmd" in
     on|start|encender) encender ;;
     off|stop|apagar) apagar "${1:-}" ;;
@@ -784,13 +938,18 @@ case "$cmd" in
     _revisar) revisar ;;
     _vigilar) vigilar "$@" ;;
     _ventanas) ventanas ;;
+    _lanzador) lanzador ;;
+    _accesos) accesos ;;
+    apps-disponibles|disponibles) apps_disponibles ;;
+    agregar-app|agregar) agregar_app "$@" ;;
+    quitar-app|quitar) quitar_app "$@" ;;
     auto) configurar_auto "${1:-}" ;;
     log|registro) ver_registro "${1:-25}" ;;
     logs) exec docker logs -f --tail 30 "$CONTENEDOR" ;;
     help|-h|--help|ayuda) ayuda ;;
     *)
-        if [ -n "${APPS[$cmd]:-}" ]; then
-            abrir "${APPS[$cmd]}" "$@"
+        if [ -n "$(app_dato "$(app_clave "$cmd")" 4)" ]; then
+            abrir "$(app_clave "$cmd")" "$@"
         else
             echo "Comando desconocido: $cmd"; echo; ayuda; exit 1
         fi ;;

@@ -9,9 +9,11 @@ ICONO = "icono.svg"
 
 WIN = os.path.expanduser("~/.local/bin/win")
 ICONOS_APPS = os.path.expanduser("~/.local/share/winapps/apps")
-APPS = [("word", "Word", "word-o365", "WINWORD"), ("excel", "Excel", "excel-o365", "EXCEL"),
-        ("ppt", "PowerPoint", "powerpoint-o365", "POWERPNT")]
-ICONO_DE = {proc: carpeta for _, _, carpeta, proc in APPS}
+# apps del Lanzador por defecto; la lista real la entrega "win _lanzador" (apps elegidas)
+APPS_INICIALES = [("word", "Word", os.path.join(ICONOS_APPS, "word-o365", "icon.svg"), "WINWORD"),
+                  ("excel", "Excel", os.path.join(ICONOS_APPS, "excel-o365", "icon.svg"), "EXCEL"),
+                  ("ppt", "PowerPoint", os.path.join(ICONOS_APPS, "powerpoint-o365", "icon.svg"),
+                   "POWERPNT")]
 PAGINAS = [("lanzador", "Lanzador"), ("ventanas", "Ventanas"), ("windows", "Windows")]
 AUTO = [(0, "No"), (15, "15 min"), (30, "30 min"), (60, "1 h")]
 REFRESCO_MS = 3000
@@ -192,26 +194,55 @@ def crear(api):
 
     # ----- página Lanzador ----------------------------------------------------
 
-    lanzador_caja = Gtk.Box(spacing=30, homogeneous=True)
-    for clave, nombre, carpeta, _ in APPS:
-        caja = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=22,
-                       valign=Gtk.Align.CENTER)
-        caja.append(Gtk.Image(file=os.path.join(ICONOS_APPS, carpeta, "icon.svg"),
-                              pixel_size=220))
-        caja.append(Gtk.Label(label=nombre, css_classes=["nombre"]))
-        abajo = Gtk.Box(spacing=12, halign=Gtk.Align.CENTER)
-        ruedita = Gtk.Spinner(visible=False)
-        ruedita.set_size_request(30, 30)
-        etapa = Gtk.Label(css_classes=["etapa"], visible=False, wrap=True,
-                          justify=Gtk.Justification.CENTER)
-        abajo.append(ruedita)
-        abajo.append(etapa)
-        caja.append(abajo)
-        b = api.accion(Gtk.Button(child=caja, css_classes=["win-app"]),
-                       lambda c=clave, n=nombre: abrir(c, n))
-        mosaicos[clave] = (b, ruedita, etapa)
-        lanzador_caja.append(b)
+    lanzador_caja = Gtk.Grid(column_spacing=30, row_spacing=30, column_homogeneous=True,
+                             row_homogeneous=True)
     paginas.add_named(lanzador_caja, "lanzador")
+    apps_lanzador = []
+    icono_de = {}           # PROCESO -> ícono, para la página Ventanas
+
+    def imagen(icono, tam):
+        if icono.startswith("/"):
+            return Gtk.Image(file=icono, pixel_size=tam)
+        return Gtk.Image(icon_name=icono, pixel_size=tam)
+
+    def armar_lanzador(apps):
+        if apps == apps_lanzador or not apps:
+            return
+        apps_lanzador[:] = apps
+        icono_de.clear()
+        api.vaciar(lanzador_caja)
+        mosaicos.clear()
+        n = len(apps)
+        columnas = n if n <= 3 else (3 if n <= 6 else 4)
+        tam = 220 if n <= 3 else (140 if n <= 6 else 110)
+        for i, (clave, nombre, icono, proc) in enumerate(apps):
+            icono_de[proc] = icono
+            caja = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18,
+                           valign=Gtk.Align.CENTER)
+            caja.append(imagen(icono, tam))
+            caja.append(Gtk.Label(label=nombre, css_classes=["nombre"], ellipsize=3))
+            abajo = Gtk.Box(spacing=12, halign=Gtk.Align.CENTER)
+            ruedita = Gtk.Spinner(visible=False)
+            ruedita.set_size_request(30, 30)
+            etapa = Gtk.Label(css_classes=["etapa"], visible=False, wrap=True,
+                              justify=Gtk.Justification.CENTER)
+            abajo.append(ruedita)
+            abajo.append(etapa)
+            caja.append(abajo)
+            b = api.accion(Gtk.Button(child=caja, css_classes=["win-app"]),
+                           lambda c=clave, n=nombre, p=proc: abrir(c, n, p))
+            mosaicos[clave] = (b, ruedita, etapa)
+            lanzador_caja.attach(b, i % columnas, i // columnas, 1, 1)
+
+    def cargar_lanzador():
+        def listo(ok, salida):
+            apps = [tuple(l.split("|", 3)) for l in salida.splitlines() if l.count("|") >= 3]
+            if ok and apps:
+                armar_lanzador(apps)
+        correr(["_lanzador"], listo)
+
+    armar_lanzador(APPS_INICIALES)
+    cargar_lanzador()
 
     # ----- página Ventanas ----------------------------------------------------
 
@@ -283,9 +314,12 @@ def crear(api):
 
     # ----- carga de apps --------------------------------------------------------
 
-    def contar(nombre):
-        # "Word", "Documento1 - Word" o "Microsoft Word" (mientras arranca)
-        return sum(1 for t in ventanas if t == nombre or t.endswith(" " + nombre))
+    def contar(nombre, proc=""):
+        # por proceso si el agente lo informa (Thincast); si no, por título: "Word",
+        # "Documento1 - Word" o "Microsoft Word" (mientras arranca)
+        if proc and any(p for p, _ in ventanas):
+            return sum(1 for p, _ in ventanas if p == proc)
+        return sum(1 for _, t in ventanas if t == nombre or t.endswith(" " + nombre))
 
     def mostrar_carga(clave, texto, modo):
         b, ruedita, etapa = mosaicos[clave]
@@ -313,7 +347,8 @@ def crear(api):
         ahora = GLib.get_monotonic_time() / 1e6
         for clave, c in list(cargando.items()):
             # con la app ya abierta, Office puede reutilizar su ventana en vez de abrir otra
-            if contar(c["nombre"]) > c["base"] or (c["base"] and ahora - c["inicio"] >= 6):
+            if (contar(c["nombre"], c["proc"]) > c["base"]
+                    or (c["base"] and ahora - c["inicio"] >= 6)):
                 terminar_carga(clave, "¡Lista!", "", 2500)
             elif ahora - c["inicio"] > c["limite"]:
                 terminar_carga(clave, "No se abrió. Toca para reintentar.", "fallo", 8000)
@@ -368,10 +403,9 @@ def crear(api):
             return
         for proc, nombre in nueva:
             fila = Gtk.Box(spacing=22, css_classes=["win-fila"])
-            carpeta = ICONO_DE.get(proc)
-            if carpeta:
-                fila.append(Gtk.Image(file=os.path.join(ICONOS_APPS, carpeta, "icon.svg"),
-                                      pixel_size=72))
+            icono = icono_de.get(proc)
+            if icono:
+                fila.append(imagen(icono, 72))
             fila.append(Gtk.Label(label=nombre, css_classes=["win-fila-nombre"], xalign=0,
                                   hexpand=True))
             fila.append(api.accion(
@@ -392,7 +426,9 @@ def crear(api):
             e, ram, apps, auto, agente = partes[:5]
             cpu = int(partes[5]) if len(partes) == 6 and partes[5].isdigit() else 0
             mostrar(e, int(ram or 0), int(apps or 0), int(auto or 0), agente == "1", cpu)
-            ventanas[:] = [l[8:] for l in lineas[1:] if l.startswith("ventana|")]
+            # "ventana|PROCESO|título" (o "ventana|título" con un win anterior)
+            ventanas[:] = [tuple(l[8:].split("|", 1)) if l.count("|") >= 2 else ("", l[8:])
+                           for l in lineas[1:] if l.startswith("ventana|")]
             mostrar_abiertas([tuple(l.split("|", 1)) for l in lineas[1:]
                               if "|" in l and not l.startswith("ventana|")])
             revisar_cargas()
@@ -431,14 +467,14 @@ def crear(api):
             return
         orden(["on"], "Encendiendo Windows…")
 
-    def abrir(clave, nombre):
+    def abrir(clave, nombre, proc=""):
         if clave in cargando:
             api.avisar(f"{nombre} ya se está abriendo…")
             return
         if ocupado():
             return
         apagado = estado["e"] in ("apagado", "pausado", "arrancando")
-        cargando[clave] = {"nombre": nombre, "base": contar(nombre),
+        cargando[clave] = {"nombre": nombre, "proc": proc, "base": contar(nombre, proc),
                            "inicio": GLib.get_monotonic_time() / 1e6,
                            "limite": 150 if apagado else 75}
         mostrar_carga(clave, "Encendiendo Windows…" if apagado else f"Abriendo {nombre}…",
@@ -546,6 +582,7 @@ def crear(api):
             reloj[0] = 0
         if si:
             refrescar()
+            cargar_lanzador()
             reloj[0] = GLib.timeout_add(REFRESCO_MS, lambda: refrescar() or True)
         else:
             responder(False)

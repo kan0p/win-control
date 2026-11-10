@@ -39,7 +39,7 @@ function Atender {
         switch ($l[0]) {
             'abrir' {
                 $exe = $l[1]
-                $proc = [IO.Path]::GetFileNameWithoutExtension($exe)
+                $proc = [IO.Path]::GetFileNameWithoutExtension($exe).ToUpper()
                 $script:nombres[$proc] = $l[2]
                 Log "abrir $proc"
                 Paso "Start-Process $proc"
@@ -54,6 +54,13 @@ function Atender {
                 Log "maximizar $($l[1])"
                 Get-Process -Name $l[1] | Where-Object { $_.MainWindowHandle -ne 0 } |
                     ForEach-Object { [void][WinControl.Ventana]::ShowWindowAsync($_.MainWindowHandle, 3) }
+            }
+            'office' {
+                # agrega o quita apps de Office; pide permisos de administrador (UAC)
+                Log "office: $($l[1])"
+                $argumentos = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -Apps "{1}" -Producto {2} -Marca "{3}" -Elevar' -f
+                    (Join-Path $Dir 'office.ps1'), $l[1], $l[2], (Join-Path $Dir 'office.txt')
+                Start-Process powershell.exe -ArgumentList $argumentos
             }
             'forzar' { Log "forzar $($l[1])"; Stop-Process -Name $l[1] -Force }
             'salir' { Salir }
@@ -103,11 +110,11 @@ while ($true) {
     Paso 'listar procesos'
     $vivos = Vivos
     Paso 'escribir abiertas.txt'
-    # apps abiertas ("PROCESO|nombre") y títulos de sus ventanas ("v|título"), para saber cuándo aparecen
+    # apps abiertas ("PROCESO|nombre") y sus ventanas ("v|PROCESO|título"), para saber cuándo aparecen
     $lineas = @($vivos | ForEach-Object { '{0}|{1}' -f $_, $nombres[$_] })
     if ($vivos.Count -gt 0) {
         $lineas += @(Get-Process -Name $vivos | Where-Object { $_.MainWindowTitle } |
-                     ForEach-Object { 'v|' + $_.MainWindowTitle })
+                     ForEach-Object { 'v|{0}|{1}' -f $_.ProcessName.ToUpper(), $_.MainWindowTitle })
     }
     Set-Content -LiteralPath $estado -Encoding UTF8 -Value $lineas
     $ahora = Get-Date

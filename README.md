@@ -4,24 +4,39 @@ Comando `win` para encender, apagar y usar el Windows de [WinApps](https://githu
 
 La idea: Windows solo ocupa RAM mientras lo usas. Al abrir Word, Excel o PowerPoint desde el menú, `win` lo enciende y espera a que esté listo; cuando no lo usas, lo apagas con `win off` o dejas que se apague solo.
 
-## Requisitos
-
-- WinApps instalado para el usuario (`setup.sh --user`) con `WAFLAVOR="docker"`.
-- Contenedor llamado `WinApps` (el `compose.yaml` de WinApps ya lo nombra así).
-- Usuario en el grupo `docker`.
-- Opcional: GlassPad 0.9.1 o posterior para el complemento.
-
-## Instalación
+## Instalación desde cero
 
 ```sh
 git clone https://github.com/kan0p/win-control
 cd win-control
-./install.sh
+./instalar-todo.sh
 ```
 
-No usa root. Crea un enlace `~/.local/bin/win`, hace que los accesos de Word, Excel, PowerPoint y el escritorio de Windows del menú pasen por `win`, agrega `-gfx` a `RDP_FLAGS` en `winapps.conf` y, si GlassPad está instalado, agrega el complemento **Windows**.
+El instalador pregunta y luego hace todo solo, menos activar Office:
 
-Desinstalar: `./install.sh --desinstalar`
+1. **Cliente RDP** para las apps sueltas: Thincast (recomendado) o FreeRDP.
+2. **Plan de Microsoft 365**: para empresas (Business) o grandes empresas y educación (E3/E5/A3/A5).
+3. **Apps extra**: de Office (Outlook, OneNote, Access), que se instalan en Windows, y de Windows (Bloc de notas, Símbolo del sistema, PowerShell, Explorador, Paint), que se agregan al menú y a la ScreenPad. Word, Excel y PowerPoint van siempre.
+4. **RAM y núcleos** para Windows.
+5. **ISO de Windows 11**: la busca en Descargas, Documentos, Escritorio y pendrives (los monta si hace falta); también acepta una ruta o la descarga de Microsoft. Solo se usa para instalar.
+
+Después instala los paquetes (pide sudo: pacman, apt, dnf o zypper), crea el contenedor de Windows (dockur/windows, con los archivos de preparación de WinApps), instala Office con la Office Deployment Tool durante la instalación de Windows, y deja `win`, los accesos del menú y el complemento de GlassPad. Tarda de 30 a 60 minutos sin intervención.
+
+**Lo único manual:** abrir Word e iniciar sesión con tu cuenta de Microsoft 365 para activar la licencia. Windows queda sin activar.
+
+`./instalar-todo.sh --simular` hace las preguntas y genera la configuración en una carpeta temporal sin instalar nada.
+
+`./desinstalar-todo.sh` borra el Windows de win-control (con todo lo que tenga dentro), su configuración, los accesos y el complemento; opcionalmente también una instalación anterior de WinApps y Thincast. No quita los paquetes del sistema.
+
+### Apps
+
+```
+win apps-disponibles        catálogo (apps.conf) y cuáles están en el menú
+win agregar-app outlook     agrega una app; si es de Office y no está en Windows, la instala
+win quitar-app notas        la quita del menú y la ScreenPad (en Windows sigue instalada)
+```
+
+Agregar una app de Office después de instalar ejecuta la Office Deployment Tool dentro de Windows y pide permisos de administrador (UAC).
 
 ## Uso
 
