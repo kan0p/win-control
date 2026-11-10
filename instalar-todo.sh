@@ -118,35 +118,95 @@ NUCLEOS="$(preguntar "Núcleos de CPU para Windows" "$NUCLEOS_DEF")"
 [[ "$NUCLEOS" =~ ^[0-9]+$ ]] && [ "$NUCLEOS" -ge 1 ] || morir "los núcleos deben ser un número."
 
 paso "Imagen de Windows 11 (ISO)"
+
+# describe una ISO oficial de Windows por su etiqueta (CCCOMA_X64FRE_ES-MX_DV9) y su nombre;
+# no imprime nada si no es una ISO oficial de Windows
+describir_iso() {
+    local iso="$1" etiqueta idioma version arq
+    etiqueta="$(blkid -o value -s LABEL "$iso" 2>/dev/null)"
+    [[ "$etiqueta" =~ ^(CCCOMA|CCSA|CPBA|CENA|J_CCSA)_([A-Z0-9]+)FRE_([A-Za-z]{2}-[A-Za-z]{2}) ]] || return 1
+    arq="${BASH_REMATCH[2]}"; idioma="${BASH_REMATCH[3]^^}"
+    [ "$arq" = X64 ] || return 1
+    case "$idioma" in
+        ES-MX) idioma="español (México)" ;; ES-ES) idioma="español (España)" ;;
+        EN-US) idioma="inglés (EE. UU.)" ;; EN-GB) idioma="inglés (Reino Unido)" ;;
+        PT-BR) idioma="portugués (Brasil)" ;; PT-PT) idioma="portugués (Portugal)" ;;
+        FR-FR) idioma="francés" ;; DE-DE) idioma="alemán" ;; IT-IT) idioma="italiano" ;;
+    esac
+    case "$(basename "$iso")" in
+        *11*) version="Windows 11" ;;
+        *10*) version="Windows 10 (no recomendado)" ;;
+        *) version="Windows (versión no indicada en el nombre)" ;;
+    esac
+    echo "$version · $idioma · 64 bits · $(du -h "$iso" | cut -f1)"
+}
+
 # pendrives conectados pero sin montar: se montan como lo haría el gestor de archivos
-if command -v udisksctl >/dev/null; then
+montar_pendrives() {
+    command -v udisksctl >/dev/null || return 0
     while read -r dev rm tam fs punto; do
         [ "$rm" = 1 ] && [ -z "$punto" ] && [ "$tam" -ge 1073741824 ] &&
             [[ "$fs" =~ ^(vfat|exfat|ntfs|ext4)$ ]] &&
             udisksctl mount -b "/dev/$dev" --no-user-interaction >/dev/null 2>&1 &&
             info "Pendrive /dev/$dev montado para buscar la ISO."
     done < <(lsblk -brno NAME,HOTPLUG,SIZE,FSTYPE,MOUNTPOINT 2>/dev/null)
-fi
-CARPETAS_ISO=()
-for c in "$(xdg-user-dir DOWNLOAD 2>/dev/null || true)" "$(xdg-user-dir DOCUMENTS 2>/dev/null || true)" \
-         "$(xdg-user-dir DESKTOP 2>/dev/null || true)" "$HOME/Descargas" "$HOME/Downloads" \
-         "$HOME/Documentos" "$HOME/Documents" "$HOME/Escritorio" "$HOME/Desktop" /run/media/"$USER"/*; do
-    [ -n "$c" ] && [ -d "$c" ] && [ "$c" != "$HOME" ] && CARPETAS_ISO+=("$c")
-done
-mapfile -t ISOS < <(find "${CARPETAS_ISO[@]}" -maxdepth 2 -type f -iname '*win*11*.iso' 2>/dev/null | sort -u)
-OPCIONES=()
-for iso in "${ISOS[@]}"; do OPCIONES+=("$iso ($(du -h "$iso" | cut -f1))"); done
-OPCIONES+=("Escribir la ruta de otra ISO" "Descargarla de Microsoft (puede quedar en inglés)")
-[ ${#ISOS[@]} -gt 0 ] || info "No encontré ISOs de Windows 11 en Descargas, Documentos, Escritorio ni pendrives."
-n="$(elegir "¿Qué ISO usar? (recomendada: Windows 11 en español)" "${OPCIONES[@]}")"
+    return 0
+}
+
+# busca ISO oficiales de Windows en las carpetas dadas y deja elegir; ISO="" si no hay
+buscar_iso() {
+    local isos=() opciones=() iso d otras=0 n
+    while IFS= read -r iso; do
+        if d="$(describir_iso "$iso")"; then
+            isos+=("$iso"); opciones+=("$(basename "$iso") — $d")
+        else
+            otras=$((otras + 1))
+        fi
+    done < <(find "$@" -maxdepth 3 -type f -iname '*.iso' 2>/dev/null | sort -u)
+    if [ "$otras" -gt 0 ]; then info "Se ignoraron $otras ISO que no son de Windows oficial de 64 bits."; fi
+    case ${#isos[@]} in
+        0) info "No encontré ISO oficiales de Windows ahí."; ISO="" ;;
+        1) info "Encontré: ${opciones[0]}"
+           info "En: ${isos[0]}"
+           if [ "$(preguntar "¿Usar esta ISO? (s/n)" "s")" = s ]; then ISO="${isos[0]}"; else ISO=""; fi ;;
+        *) n="$(elegir "Encontré ${#isos[@]} ISO de Windows. ¿Cuál usar?" "${opciones[@]}")"
+           ISO="${isos[$((n - 1))]}"
+           info "En: $ISO" ;;
+    esac
+}
+
 ISO=""
-if [ "$n" -le ${#ISOS[@]} ]; then
-    ISO="${ISOS[$((n - 1))]}"
-elif [ "$n" -eq $(( ${#ISOS[@]} + 1 )) ]; then
-    ISO="$(preguntar "Ruta de la ISO" "")"
-    ISO="${ISO/#\~/$HOME}"
-    [ -f "$ISO" ] || morir "no existe el archivo $ISO"
-fi
+while [ -z "$ISO" ]; do
+    case "$(elegir "¿De dónde sale Windows?" \
+            "Buscar una ISO en Descargas, Documentos, Escritorio y pendrives (recomendado)" \
+            "Indicar la ruta de una ISO o de una carpeta donde buscar" \
+            "Descargarla de Microsoft durante la instalación (~6 GB; puede quedar en inglés)")" in
+        1)  montar_pendrives
+            CARPETAS_ISO=()
+            for c in "$(xdg-user-dir DOWNLOAD 2>/dev/null || true)" "$(xdg-user-dir DOCUMENTS 2>/dev/null || true)" \
+                     "$(xdg-user-dir DESKTOP 2>/dev/null || true)" "$HOME/Descargas" "$HOME/Downloads" \
+                     "$HOME/Documentos" "$HOME/Documents" "$HOME/Escritorio" "$HOME/Desktop" /run/media/"$USER"/*; do
+                [ -n "$c" ] && [ -d "$c" ] && [ "$c" != "$HOME" ] && CARPETAS_ISO+=("$c")
+            done
+            buscar_iso "${CARPETAS_ISO[@]}" ;;
+        2)  r="$(preguntar "Ruta de la ISO o de una carpeta" "")"
+            r="${r/#\~/$HOME}"
+            if [ -d "$r" ]; then
+                buscar_iso "$r"
+            elif [ -f "$r" ]; then
+                if d="$(describir_iso "$r")"; then
+                    info "$d"; ISO="$r"
+                else
+                    info "Esa ISO no parece un Windows oficial de 64 bits."
+                    [ "$(preguntar "¿Usarla igual? (s/n)" "n")" = s ] && ISO="$r"
+                fi
+            else
+                info "No existe: $r"
+            fi ;;
+        *)  ISO="descargar" ;;
+    esac
+done
+[ "$ISO" = descargar ] && ISO=""
 
 # idioma y teclado según el sistema
 LOCAL="${LANG%%.*}"
