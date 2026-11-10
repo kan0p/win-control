@@ -4,6 +4,14 @@ Comando `win` para encender, apagar y usar el Windows de [WinApps](https://githu
 
 La idea: Windows solo ocupa RAM mientras lo usas. Al abrir Word, Excel o PowerPoint desde el menú, `win` lo enciende y espera a que esté listo; cuando no lo usas, lo apagas con `win off` o dejas que se apague solo.
 
+## Capturas
+
+Complemento de la ScreenPad (GlassPad), con tres páginas que se cambian deslizando el dedo o con las pestañas:
+
+| Lanzador | Ventanas | Windows |
+|---|---|---|
+| ![Lanzador](docs/capturas/lanzador.png) | ![Ventanas abiertas](docs/capturas/ventanas.png) | ![Control de Windows](docs/capturas/windows.png) |
+
 ## Requisitos
 
 - WinApps instalado para el usuario (`setup.sh --user`) con `WAFLAVOR="docker"`.
