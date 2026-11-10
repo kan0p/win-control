@@ -1,0 +1,797 @@
+#!/usr/bin/env bash
+# win - controla el Windows de WinApps (contenedor Docker) y abre sus aplicaciones.
+# kan0p - https://github.com/kan0p/win-control - GPL-3.0-or-later
+set -uo pipefail
+
+CONTENEDOR="WinApps"
+IP_INVITADO="172.30.0.2"
+ESPERA_MAX=240
+ESPERA_CIERRE=60        # s para que las apps se cierren solas antes de apagar
+LATIDO_MAX=15           # s sin noticias del agente para darlo por colgado
+WINAPPS="$HOME/.local/bin/winapps"
+DATOS="$HOME/.local/share/winapps"
+CONF="$HOME/.config/winapps/win.conf"
+ESTADO_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/win"
+ULTIMO_USO="$ESTADO_DIR/ultimo_uso"
+CERROJO_ARRANQUE="$ESTADO_DIR/arranque.lock"
+CERROJO_CONEXION="$ESTADO_DIR/conexion.lock"
+CERROJO_ORDEN="$ESTADO_DIR/orden.lock"
+ORDEN_ACTUAL="$ESTADO_DIR/orden"
+ESCALAR="$ESTADO_DIR/forzar"
+ICONO="$DATOS/apps/windows/icon.svg"
+COLA="$ESTADO_DIR/cola"
+ABIERTAS="$ESTADO_DIR/abiertas.txt"
+FIN_SESION="$ESTADO_DIR/fin.txt"
+ULTIMO_PEDIDO="$ESTADO_DIR/ultimo_pedido"
+PID_CONEXION="$ESTADO_DIR/conexion.pid"
+REGISTRO="$ESTADO_DIR/win.log"
+REGISTRO_RDP="$ESTADO_DIR/freerdp.log"
+RAIZ="$(dirname "$(realpath "$0")")"
+AGENTE="$RAIZ/windows/agente.ps1"
+VENTANAS="$RAIZ/ventanas.py"
+# el agente usa su propia unidad (\\tsclient\win): la de la carpeta personal puede
+# quedar ocupada mucho rato mientras Office la recorre la primera vez
+AGENTE_LOCAL="$ESTADO_DIR/agente.ps1"
+AGENTE_WIN='\\tsclient\win\agente.ps1'
+ESTADO_WIN='\\tsclient\win'
+ESPERA_AGENTE=45        # s para que el agente dé señales tras conectar
+# la unidad \\tsclient\win puede montarse unos segundos después de que arranca la sesión:
+# se espera a que exista el script antes de ejecutarlo (sin comas: FreeRDP corta /app en ellas)
+ARRANQUE_AGENTE="for(\$i=0; \$i -lt 60; \$i++){ if(Test-Path '$AGENTE_WIN'){ & '$AGENTE_WIN' -Dir '$ESTADO_WIN'; break }; Start-Sleep 1 }"
+GRACIA_SESION=12        # s: el agente cierra una sesión desconectada a los 5 s y el logoff tarda
+
+mkdir -p "$ESTADO_DIR"
+AUTO_APAGADO=0
+CLIENTE_RDP=freerdp     # freerdp | thincast (solo para las apps sueltas)
+THINCAST="com.thincast.client"
+# shellcheck disable=SC1090
+[ -f "$CONF" ] && . "$CONF"
+
+declare -A APPS=(
+    [excel]=excel-o365 [word]=word-o365 [ppt]=powerpoint-o365 [powerpoint]=powerpoint-o365
+    [excel-o365]=excel-o365 [word-o365]=word-o365 [powerpoint-o365]=powerpoint-o365
+)
+
+en_terminal() { [ -t 1 ]; }
+
+# registro: ~/.local/state/win/win.log (se rota al pasar 1 MB)
+registrar() {
+    [ -f "$REGISTRO" ] && [ "$(stat -c %s "$REGISTRO")" -gt 1048576 ] && mv -f "$REGISTRO" "$REGISTRO.1"
+    printf '%s [%s] %s\n' "$(date '+%F %T')" "$$" "$*" >>"$REGISTRO" 2>/dev/null
+    return 0
+}
+
+# sin notificaciones: el texto va a la terminal o a quien llamó (la ScreenPad lo muestra)
+avisar() { registrar "aviso: $*"; echo "$*"; }
+
+# un error al abrir desde el menú o un archivo (sin terminal ni ScreenPad) se notifica brevemente
+error() {
+    if ! en_terminal && [ "${WIN_GLASSPAD:-0}" != 1 ]; then
+        ES_ERROR=1 notificar_app "${NOTIF_ICONO:-$ICONO}" "$*" 8000
+    fi
+    registrar "ERROR: $*"
+    echo "$*"; exit 1
+}
+
+# avisos de progreso que se omiten cuando otra notificación ya informa el avance
+info() { [ "${QUIETO:-0}" = 1 ] && return 0; en_terminal && avisar "$*"; return 0; }
+
+# notificación de progreso de una app; con NOTIFICAR_PROGRESO=0 (por defecto) solo se
+# muestran los errores, y el avance se ve en la ScreenPad
+notificar_app() {
+    local icono="$1" texto="$2" duracion="${3:-0}" id
+    [ "${NOTIFICAR_PROGRESO:-0}" = 1 ] || [ "${ES_ERROR:-0}" = 1 ] || return 0
+    [ "${WIN_GLASSPAD:-0}" = 1 ] && return 0
+    [ "${ES_ERROR:-0}" = 1 ] && duracion=8000
+    id="$(notify-send -p ${NOTIF_ID:+-r "$NOTIF_ID"} --app-name=Windows --icon="$icono" \
+        --expire-time="$duracion" "Windows" "$texto" 2>/dev/null)" && NOTIF_ID="$id"
+}
+
+# títulos de las ventanas visibles de la sesión: "Libro1 - Excel", "Word"…
+# con Thincast en Wayland las ventanas no son de X11: los títulos los informa el agente
+ventanas() {
+    if [ "$CLIENTE_RDP" = thincast ]; then
+        conexion_viva && [ -f "$ABIERTAS" ] && sed -n 's/^\xEF\xBB\xBF//; s/\r$//; s/^v|//p' "$ABIERTAS"
+        return 0
+    fi
+    python3 -I "$VENTANAS" 2>/dev/null
+}
+
+# "Word", "Documento1 - Word" o "Microsoft Word" (mientras arranca)
+contar_ventanas() { ventanas | grep -cE "(^| )$1\$"; }
+
+esperar() { sleep "$1"; }
+
+# ----- contenedor ----------------------------------------------------------------
+
+estado_docker() { docker inspect -f '{{.State.Status}}' "$CONTENEDOR" 2>/dev/null || echo "ausente"; }
+
+rdp_listo() {
+    docker exec "$CONTENEDOR" bash -c "timeout 2 bash -c '>/dev/tcp/$IP_INVITADO/3389'" &>/dev/null
+}
+
+orden_en_curso() {
+    [ -f "$ORDEN_ACTUAL" ] || return 1
+    flock -n "$CERROJO_ORDEN" true 2>/dev/null && { rm -f "$ORDEN_ACTUAL"; return 1; }
+    cat "$ORDEN_ACTUAL"
+}
+
+# apagado | arrancando | encendido | pausado | ausente | apagando | reiniciando
+estado() {
+    local o
+    if o="$(orden_en_curso)"; then echo "$o"; return; fi
+    case "$(estado_docker)" in
+        running) { agente_responde || rdp_listo; } && echo encendido || echo arrancando ;;
+        paused) echo pausado ;;
+        ausente) echo ausente ;;
+        *) echo apagado ;;
+    esac
+}
+
+prendido() { case "$(estado_docker)" in running|paused) return 0 ;; *) return 1 ;; esac; }
+
+# una sola orden de apagar/reiniciar a la vez; las repetidas se descartan
+exclusiva() {
+    local nombre="$1"; shift
+    exec 8>"$CERROJO_ORDEN"
+    if ! flock -n 8; then
+        error "Ya hay una orden en curso ($(cat "$ORDEN_ACTUAL" 2>/dev/null || echo otra)). Espera a que termine."
+    fi
+    echo "$nombre" >"$ORDEN_ACTUAL"; rm -f "$ESCALAR"
+    registrar "orden exclusiva: $nombre ($*)"
+    "$@"; local rc=$?
+    registrar "orden exclusiva: $nombre terminó (código $rc)"
+    rm -f "$ORDEN_ACTUAL" "$ESCALAR"
+    exec 8>&-
+    return $rc
+}
+
+# CPU y RAM leídas del cgroup del contenedor: instantáneo, a diferencia de docker stats (~1,3 s)
+# ~/.local/state/win/cgroup guarda "<carpeta del cgroup> <núcleos de la VM>"
+cgroup_info() {
+    local f="$ESTADO_DIR/cgroup" dir nucleos id
+    if [ -f "$f" ] && read -r dir nucleos <"$f" && [ -r "$dir/cpu.stat" ]; then
+        echo "$dir ${nucleos:-1}"; return 0
+    fi
+    id="$(docker inspect -f '{{.Id}}' "$CONTENEDOR" 2>/dev/null)" || return 1
+    dir="/sys/fs/cgroup/system.slice/docker-$id.scope"
+    [ -r "$dir/cpu.stat" ] || return 1
+    nucleos="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$CONTENEDOR" |
+        sed -n 's/^CPU_CORES=//p')"
+    echo "$dir ${nucleos:-1}" | tee "$f"
+}
+
+ram_mib() {
+    local dir _n actual inactiva
+    read -r dir _n < <(cgroup_info) || { echo 0; return; }
+    actual="$(cat "$dir/memory.current" 2>/dev/null || echo 0)"
+    inactiva="$(sed -n 's/^inactive_file //p' "$dir/memory.stat" 2>/dev/null)"
+    echo $(( (actual - ${inactiva:-0}) / 1048576 ))
+}
+
+# % de uso de los núcleos de Windows desde la consulta anterior (0 en la primera)
+cpu_pct() {
+    local dir nucleos uso ahora previo_uso previo_t f="$ESTADO_DIR/cpu.prev"
+    read -r dir nucleos < <(cgroup_info) || { echo 0; return; }
+    uso="$(sed -n 's/^usage_usec //p' "$dir/cpu.stat" 2>/dev/null)"
+    ahora="$(date +%s%6N)"
+    [ -n "$uso" ] || { echo 0; return; }
+    if [ -f "$f" ] && read -r previo_uso previo_t <"$f" && [ "$ahora" -gt "$previo_t" ] && [ "$uso" -ge "$previo_uso" ]; then
+        echo $(( (uso - previo_uso) * 100 / ((ahora - previo_t) * nucleos) ))
+    else
+        echo 0
+    fi
+    echo "$uso $ahora" >"$f"
+}
+
+marcar_uso() { date +%s >"$ULTIMO_USO"; }
+
+# el cerrojo vive solo en la subshell: no lo heredan las apps que se abren después
+encender() { ( flock 9; encender_bloqueado ) 9>"$CERROJO_ARRANQUE"; }
+
+encender_bloqueado() {
+    local e; e="$(estado)"
+    case "$e" in
+        encendido) return 0 ;;
+        apagando|reiniciando) error "Windows se está $( [ "$e" = apagando ] && echo apagando || echo reiniciando ). Espera a que termine." ;;
+        ausente) error "No existe el contenedor $CONTENEDOR. Revisa ~/.config/winapps/compose.yaml." ;;
+        pausado) docker unpause "$CONTENEDOR" >/dev/null || error "No se pudo reanudar Windows." ;;
+        apagado) info "Encendiendo Windows…"
+                 docker start "$CONTENEDOR" >/dev/null || error "No se pudo encender Windows." ;;
+    esac
+    local t=0
+    while ! rdp_listo; do
+        esperar 2; t=$((t + 2))
+        en_terminal && printf '\rEsperando a Windows… %ds' "$t"
+        [ "$t" -ge "$ESPERA_MAX" ] && { en_terminal && echo; error "Windows no respondió en ${ESPERA_MAX}s."; }
+    done
+    en_terminal && [ "$t" -gt 0 ] && printf '\r\033[K'
+    # el escritorio remoto acepta conexiones un poco antes de que Windows termine de iniciar
+    [ "$e" = apagado ] && esperar 8
+    marcar_uso
+    [ "$e" != encendido ] && info "Windows está listo."
+    return 0
+}
+
+# ----- sesión RemoteApp con agente -------------------------------------------------
+# Windows 11 24H2 no restaura las ventanas RemoteApp al reconectar a una sesión,
+# así que hay una sola conexión con un agente (agente.ps1) que abre las apps
+# dentro de ella y cierra la sesión (logoff) cuando ya no queda ninguna.
+
+conexion_pid() {
+    local pid
+    pid="$(cat "$PID_CONEXION" 2>/dev/null)" || return 1
+    [ -n "$pid" ] || return 1
+    case "$(cat "/proc/$pid/comm" 2>/dev/null)" in xfreerdp3|bwrap|flatpak|rdc) echo "$pid" ;; *) return 1 ;; esac
+}
+
+conexion_viva() { conexion_pid >/dev/null; }
+
+escritorio_abierto() {
+    local p
+    for p in $(pgrep -u "$(id -u)" -x xfreerdp3); do
+        tr '\0' '\n' <"/proc/$p/cmdline" 2>/dev/null | grep -qx '/wm-class:WindowsEscritorio' && return 0
+    done
+    return 1
+}
+
+# conexiones de win que no son la registrada (p. ej. de una sesión anterior): se eliminan
+matar_huerfanas() {
+    local p actual; actual="$(conexion_pid)"
+    for p in $(pgrep -u "$(id -u)" -x xfreerdp3; pgrep -u "$(id -u)" -x bwrap); do
+        [ "$p" = "$actual" ] && continue
+        if tr '\0' '\n' <"/proc/$p/cmdline" 2>/dev/null | grep -qE '^/wm-class:Windows$|agente\.ps1'; then
+            kill -9 "$p" 2>/dev/null && touch "$FIN_SESION" && registrar "conexión huérfana eliminada: $p"
+        fi
+    done
+    return 0
+}
+
+# el agente reescribe abiertas.txt en cada vuelta
+agente_responde() {
+    [ -f "$ABIERTAS" ] || return 1
+    [ $(( $(date +%s) - $(stat -c %Y "$ABIERTAS") )) -lt "$LATIDO_MAX" ]
+}
+
+# "proceso|nombre" por app abierta
+lista_apps() {
+    conexion_viva && [ -f "$ABIERTAS" ] || return 0
+    sed 's/^\xEF\xBB\xBF//; s/\r$//' "$ABIERTAS" | grep '|' | grep -v '^v|' || true
+}
+
+apps_abiertas() {
+    local n; n="$(lista_apps | grep -c .)"
+    # conexión recién abierta: el agente aún no informa, pero cuenta como en uso
+    [ "$n" -eq 0 ] && conexion_viva && n=1
+    echo "$n"
+}
+
+mostrar_apps() {
+    local proc nombre hay=0
+    while IFS='|' read -r proc nombre; do
+        hay=1; printf '  %-12s (%s)\n' "$nombre" "$proc"
+    done < <(lista_apps)
+    if [ "$hay" -eq 0 ]; then
+        if conexion_viva; then echo "  Conexión abierta, sin apps todavía."; else echo "  Ninguna app de Windows abierta."; fi
+    fi
+    if conexion_viva && [ -f "$ABIERTAS" ] && ! agente_responde; then
+        echo "  ¡El agente de Windows no responde! Usa: win reparar"
+    fi
+}
+
+hay_pedidos() { compgen -G "$COLA/*.pedido" >/dev/null; }
+
+# encola un pedido para el agente; descarta repetidos (pendientes o de hace < 3 s)
+pedir() {
+    mkdir -p "$COLA"
+    local contenido clave ahora k t f
+    contenido="$(printf '%s\n' "$@")"
+    clave="$(md5sum <<<"$contenido" | cut -c1-32)"
+    ahora="$(date +%s)"
+    for f in "$COLA"/*.pedido; do
+        [ -e "$f" ] && [ "$(md5sum <"$f" | cut -c1-32)" = "$clave" ] && return 0
+    done
+    # pedidos de los últimos 3 s: "clave segundos" por línea
+    local recientes=""
+    [ -f "$ULTIMO_PEDIDO" ] && recientes="$(awk -v a="$ahora" 'a - $2 < 3' "$ULTIMO_PEDIDO")"
+    grep -q "^$clave " <<<"$recientes" && return 0
+    [ "$(compgen -G "$COLA/*.pedido" | wc -l)" -ge 10 ] && error "Windows tiene demasiados pedidos pendientes. Espera un momento."
+    printf '%s\n%s %s\n' "$recientes" "$clave" "$ahora" | grep . >"$ULTIMO_PEDIDO"
+    local tmp="$COLA/.$$.$RANDOM"
+    printf '%s\n' "$@" >"$tmp" && mv "$tmp" "$COLA/$(date +%s%N).pedido"
+    registrar "pedido: $*"
+}
+
+ruta_windows() {
+    local r; r="$(realpath -m -- "$1")"
+    case "$r" in
+        # carpeta personal por Samba del contenedor (no por el canal de unidades de RDP)
+        "$HOME"/*) r="\\\\host.lan\\Data${r#"$HOME"}" ;;
+        *) return 1 ;;
+    esac
+    printf '%s' "${r//\//\\}"
+}
+
+lanzar_conexion() {
+    local RDP_USER RDP_PASS RDP_FLAGS RDP_SCALE
+    # shellcheck disable=SC1090
+    . "$HOME/.config/winapps/winapps.conf"
+    mkdir -p "$COLA"
+    cmp -s "$AGENTE" "$AGENTE_LOCAL" || cp "$AGENTE" "$AGENTE_LOCAL"
+    rm -f "$ABIERTAS"
+    [ -f "$REGISTRO_RDP" ] && mv -f "$REGISTRO_RDP" "$ESTADO_DIR/freerdp.anterior.log"
+    export REGISTRO_RDP
+    # en su propio scope de systemd: si quien la abrió (p. ej. el launcher) se reinicia, sigue viva
+    # shellcheck disable=SC2086
+    local cliente=(xfreerdp3)
+    # Thincast pregunta por el certificado autofirmado en una ventana; la conexión es solo local
+    [ "$CLIENTE_RDP" = thincast ] && cliente=(flatpak run "$THINCAST" /cert:ignore)
+    registrar "cliente RDP: $CLIENTE_RDP"
+    systemd-run --user --scope --quiet --collect --expand-environment=no --unit="win-sesion-$$-$RANDOM" -- \
+        setsid -f bash -c 'echo $$ >"$0"; exec "$@" >>"$REGISTRO_RDP" 2>&1' "$PID_CONEXION" \
+        "${cliente[@]}" ${RDP_FLAGS//+home-drive/} /u:"$RDP_USER" /p:"$RDP_PASS" \
+        /scale-desktop:"${RDP_SCALE:-100}" /drive:win,"$ESTADO_DIR" \
+        /wm-class:"Windows" \
+        /app:program:"conhost.exe",cmd:"--headless powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command $ARRANQUE_AGENTE" \
+        /v:127.0.0.1:3389 </dev/null 7>&- 8>&- 9>&-
+    local t=0
+    until conexion_viva || [ "$t" -ge 20 ]; do esperar 0.1; t=$((t + 1)); done
+    registrar "conexión lanzada: pid $(conexion_pid || echo '¿?')"
+}
+
+# una conexión cortada deja la sesión desconectada unos segundos hasta que el agente
+# la cierra; reconectar a ella dejaría las apps sin ventana
+# también espera a que termine un logoff reciente (fin.txt lo escribe el agente o win al cortar)
+esperar_sesion_anterior() {
+    local f edad
+    for f in "$ABIERTAS" "$FIN_SESION"; do
+        [ -f "$f" ] || continue
+        edad=$(( $(date +%s) - $(stat -c %Y "$f") ))
+        if [ "$edad" -lt "$GRACIA_SESION" ]; then
+            registrar "esperando $((GRACIA_SESION - edad)) s a que termine la sesión anterior"
+            esperar "$((GRACIA_SESION - edad))"
+        fi
+    done
+    rm -f "$ABIERTAS"
+}
+
+agente_arranco() {
+    local t=0
+    while [ "$t" -lt "$((ESPERA_AGENTE * 5))" ]; do
+        [ -f "$ABIERTAS" ] && return 0
+        conexion_viva || return 1
+        esperar 0.2; t=$((t + 1))
+    done
+    return 1
+}
+
+conectar() {
+    conexion_viva && return 0
+    matar_huerfanas
+    esperar_sesion_anterior
+    lanzar_conexion
+    if agente_arranco; then registrar "agente respondió"; return 0; fi
+    registrar "el agente no arrancó en ${ESPERA_AGENTE} s: se reinicia Windows y se reintenta"
+    # la sesión de Windows quedó en mal estado: reiniciar y reintentar una vez
+    [ -n "${NOTIF_ID:-}" ] && notificar_app "$NOTIF_ICONO" "Windows no respondió; reiniciándolo y reintentando (1-2 min)…" ||
+        avisar "Windows no respondió; reiniciándolo y reintentando (1-2 min)…"
+    # se conserva el pedido que originó la conexión para que lo atienda la sesión nueva
+    CONSERVAR_PEDIDOS=1 exclusiva reiniciando reiniciar_ahora 1 || return 1
+    lanzar_conexion
+    agente_arranco || error "No se pudo abrir la sesión de Windows. Prueba: win reparar"
+}
+
+# abre la conexión si no hay una; el cerrojo evita dos conexiones a la vez
+asegurar_conexion() {
+    ( flock 7; conectar ) 7>"$CERROJO_CONEXION"
+}
+
+# 0: la sesión terminó; 1: se acabó el tiempo; 3: alguien pidió forzar mientras tanto
+esperar_fin_sesion() {
+    local limite="$1" t=0
+    while conexion_viva && [ "$t" -lt "$((limite * 5))" ]; do
+        [ -f "$ESCALAR" ] && return 3
+        esperar 0.2; t=$((t + 1))
+    done
+    ! conexion_viva
+}
+
+# cierre normal: cada app recibe la orden de su X (Windows pregunta si guardar)
+cerrar_todo_normal() {
+    conexion_viva || return 0
+    agente_responde || error "El agente de Windows no responde. Fuerza el cierre (win cerrar -f todas) o usa win reparar."
+    local proc nombre
+    while IFS='|' read -r proc nombre; do pedir cerrar "$proc"; done < <(lista_apps)
+    avisar "Cerrando las apps de Windows; si hay cambios sin guardar, Windows pregunta…"
+    esperar_fin_sesion "$ESPERA_CIERRE"
+    case $? in
+        0) return 0 ;;
+        3) avisar "Forzando el cierre de las apps…"; cerrar_todo_forzado; return 0 ;;
+        *) error "Quedan apps abiertas (¿cambios sin guardar?). Guarda y ciérralas, o fuerza el cierre." ;;
+    esac
+}
+
+# cierre forzado: se pierde lo no guardado; devuelve 2 si Windows quedó con una sesión trabada
+cerrar_todo_forzado() {
+    conexion_viva || return 0
+    local pid; pid="$(conexion_pid)"
+    if agente_responde; then
+        pedir salir
+        esperar_fin_sesion 10 && { rm -f "$COLA"/*.pedido "$ABIERTAS"; return 0; }
+        # el agente borra abiertas.txt justo antes del logoff: si ya no está, la sesión se cerró
+        # bien y solo falta el cliente (Thincast tarda más que FreeRDP en terminar)
+        if [ ! -f "$ABIERTAS" ]; then
+            kill -9 "$pid" 2>/dev/null
+            touch "$FIN_SESION"     # la espera para reconectar cuenta desde que se corta el cliente
+            registrar "sesión cerrada por el agente; cliente $pid terminado"
+            [ "${CONSERVAR_PEDIDOS:-0}" = 1 ] || rm -f "$COLA"/*.pedido
+            return 0
+        fi
+    fi
+    kill -9 "$pid" 2>/dev/null
+    touch "$FIN_SESION"
+    registrar "conexión $pid cortada a la fuerza (agente sin respuesta)"
+    [ "${CONSERVAR_PEDIDOS:-0}" = 1 ] || rm -f "$COLA"/*.pedido
+    rm -f "$ABIERTAS"
+    return 2
+}
+
+maximizar() {
+    [ -n "${1:-}" ] || error "Uso: win maximizar <app>   (los nombres salen en: win apps)"
+    conexion_viva && agente_responde || error "No hay apps de Windows abiertas o el agente no responde."
+    pedir maximizar "${1^^}"
+}
+
+cerrar_apps() {
+    local forzar=0 objetivo=""
+    for a in "$@"; do
+        case "$a" in -f|--forzar) forzar=1 ;; *) objetivo="$a" ;; esac
+    done
+    [ -n "$objetivo" ] || error "Uso: win cerrar [-f] <app>|todas   (los nombres salen en: win apps)"
+    conexion_viva || { avisar "No hay apps de Windows abiertas."; return 0; }
+    if [ "$objetivo" = todas ]; then
+        if [ "$forzar" -eq 1 ]; then
+            cerrar_todo_forzado
+            if [ $? -eq 2 ]; then
+                avisar "El agente no respondía: reiniciando Windows para limpiar la sesión…"
+                exclusiva reiniciando reiniciar_ahora
+            else
+                avisar "Apps de Windows cerradas a la fuerza."
+            fi
+        else
+            cerrar_todo_normal && avisar "Apps de Windows cerradas."
+        fi
+        return
+    fi
+    agente_responde || error "El agente de Windows no responde. Usa: win reparar"
+    objetivo="${objetivo^^}"
+    if [ "$forzar" -eq 1 ]; then
+        pedir forzar "$objetivo" && avisar "Forzando el cierre de $objetivo…"
+    else
+        pedir cerrar "$objetivo" && avisar "Cerrando $objetivo…"
+    fi
+}
+
+# ----- órdenes ---------------------------------------------------------------------
+
+apagar_ahora() {
+    local forzar="$1"
+    prendido || { avisar "Windows ya está apagado."; return 0; }
+    if [ "$forzar" = 1 ]; then cerrar_todo_forzado; else cerrar_todo_normal || return 1; fi
+    matar_huerfanas
+    [ "$(estado_docker)" = paused ] && docker unpause "$CONTENEDOR" >/dev/null
+    avisar "Apagando Windows (puede tardar hasta 2 minutos)…"
+    docker stop "$CONTENEDOR" >/dev/null && avisar "Windows apagado. RAM liberada."
+}
+
+reiniciar_ahora() {
+    local forzar="${1:-1}"
+    apagar_ahora "$forzar" || return 1
+    rm -f "$ORDEN_ACTUAL"
+    encender
+}
+
+# pedir forzar mientras un apagado/reinicio normal espera a las apps lo escala
+escalar_si_corresponde() {
+    local o
+    [ "$1" = 1 ] && o="$(orden_en_curso)" || return 1
+    touch "$ESCALAR"
+    avisar "Forzando: la orden en curso ($o) cierra las apps sin guardar."
+}
+
+apagar() {
+    local forzar=0
+    [ "${1:-}" = "-f" ] && forzar=1
+    escalar_si_corresponde "$forzar" && return 0
+    prendido || { avisar "Windows ya está apagado."; return 0; }
+    exclusiva apagando apagar_ahora "$forzar"
+}
+
+reiniciar() {
+    local forzar=0
+    [ "${1:-}" = "-f" ] && forzar=1
+    escalar_si_corresponde "$forzar" && return 0
+    prendido || { encender; return; }
+    exclusiva reiniciando reiniciar_ahora "$forzar"
+}
+
+reparar() {
+    avisar "Reiniciando Windows para limpiar la sesión…"
+    exclusiva reiniciando reiniciar_ahora 1
+}
+
+abrir() {
+    local app="$1" archivo="" exe nombre WIN_EXECUTABLE="" FULL_NAME=""
+    shift
+    local info="$DATOS/apps/$app/info"
+    [ -f "$info" ] || error "WinApps no tiene configurada la app $app."
+    # shellcheck disable=SC1090
+    . "$info"
+    exe="$WIN_EXECUTABLE"; nombre="${FULL_NAME#Microsoft }"
+    if [ $# -gt 0 ] && [ -n "$1" ]; then
+        [ $# -gt 1 ] && avisar "Se abre solo el primer archivo; los demás ábrelos desde $nombre."
+        archivo="$(ruta_windows "$1")" || error "Windows solo ve archivos dentro de tu carpeta personal: copia el archivo ahí primero."
+    fi
+    local icono="$DATOS/apps/$app/icon.svg" base limite=60
+    base="$(contar_ventanas "$nombre")"
+    NOTIF_ICONO="$icono"
+    if ! en_terminal; then
+        QUIETO=1
+        case "$(estado)" in
+            encendido) notificar_app "$icono" "Abriendo $nombre…" ;;
+            *) notificar_app "$icono" "Encendiendo Windows para abrir $nombre…"; limite=90 ;;
+        esac
+    fi
+    escritorio_abierto && error "Tienes abierto el escritorio de Windows: abre $nombre ahí (tus archivos están en la carpeta Shared) o cierra el escritorio primero."
+    encender || exit 1
+    en_terminal || notificar_app "$icono" "Abriendo $nombre…"
+    marcar_uso
+    if conexion_viva && [ -f "$ABIERTAS" ] && ! agente_responde; then
+        error "El agente de Windows no responde. Usa: win reparar"
+    fi
+    pedir abrir "$exe" "$nombre" "$archivo"
+    setsid -f "$0" _vigilar "$nombre" "$base" "$limite" "${NOTIF_ID:-}" "$icono" \
+        </dev/null >/dev/null 2>&1 7>&- 8>&- 9>&-
+    conexion_viva || { asegurar_conexion; return 0; }
+    # el agente podría estar cerrando la sesión justo ahora: si nadie toma el pedido, reconectar
+    local t=0
+    while hay_pedidos && [ "$t" -lt 40 ]; do esperar 0.2; t=$((t + 1)); done
+    if hay_pedidos; then
+        esperar_fin_sesion 10
+        asegurar_conexion
+    fi
+}
+
+# espera a que aparezca una ventana nueva de la app y actualiza la notificación
+vigilar() {
+    local nombre="$1" base="$2" limite="$3" icono="$5" t=0
+    NOTIF_ID="$4"
+    while [ "$t" -lt "$limite" ]; do
+        sleep 1; t=$((t + 1))
+        # con la app ya abierta, Office puede reutilizar su ventana en vez de abrir otra
+        if [ "$(contar_ventanas "$nombre")" -gt "$base" ] || { [ "$base" -gt 0 ] && [ "$t" -ge 6 ]; }; then
+            registrar "$nombre lista tras ${t} s"
+            notificar_app "$icono" "$nombre está listo." 3000
+            return 0
+        fi
+    done
+    registrar "ERROR: $nombre no mostró ventana en ${limite} s (agente: $(agente_responde && echo responde || echo 'NO responde'))"
+    ES_ERROR=1 notificar_app "$icono" "$nombre no mostró su ventana en ${limite}s. Si no aparece, prueba: win reparar" 10000
+}
+
+# FreeRDP a veces se congela al aparecer una ventana nueva: las apps siguen vivas en Windows.
+# Se abre el escritorio completo sobre la misma sesión: al responder "Sí" en Windows, toma el
+# control sin desconectarla (así el agente no la cierra). La conexión congelada se corta recién
+# al cerrar el escritorio, y entonces Windows se reinicia.
+rescatar() {
+    local vieja; vieja="$(conexion_pid)" || error "No hay una sesión de apps abierta que rescatar."
+    local RDP_USER RDP_PASS RDP_FLAGS
+    # shellcheck disable=SC1090
+    . "$HOME/.config/winapps/winapps.conf"
+    registrar "rescate: escritorio sobre la sesión de la conexión $vieja"
+    systemd-run --user --scope --quiet --collect --expand-environment=no --unit="win-escritorio-$$" -- \
+        setsid -f bash -c 'v=$1; shift; "$@" >/dev/null 2>&1; kill -9 "$v" 2>/dev/null; "$0" reparar >/dev/null 2>&1' "$(realpath "$0")" "$vieja" \
+        xfreerdp3 ${RDP_FLAGS//+home-drive/} /u:"$RDP_USER" /p:"$RDP_PASS" /title:"Windows" \
+        /wm-class:"WindowsEscritorio" /dynamic-resolution /size:1900x1000 /v:127.0.0.1:3389 \
+        </dev/null 7>&- 8>&- 9>&-
+    avisar "Rescate: en la ventana de Windows responde \"Sí\" para tomar la sesión con tus apps. Guarda tu trabajo; al cerrar el escritorio, Windows se reinicia."
+}
+
+# el escritorio completo deja la sesión en un estado en que RemoteApp no muestra
+# ventanas; al cerrarlo se reinicia Windows para limpiarla
+escritorio() {
+    [ "$(apps_abiertas)" -gt 0 ] && error "Cierra primero las apps de Windows abiertas (o usa: win cerrar -f todas)."
+    encender || exit 1
+    matar_huerfanas
+    esperar_sesion_anterior
+    local RDP_USER RDP_PASS RDP_FLAGS
+    # shellcheck disable=SC1090
+    . "$HOME/.config/winapps/winapps.conf"
+    avisar "Abriendo el escritorio de Windows. Tus archivos están en la carpeta Shared del escritorio."
+    # escritorio completo sin redirección de unidades (los archivos van por Samba: \\host.lan\Data);
+    # al cerrarlo se reinicia Windows para que las apps sueltas vuelvan a funcionar
+    # shellcheck disable=SC2086
+    systemd-run --user --scope --quiet --collect --expand-environment=no --unit="win-escritorio-$$" -- \
+        setsid -f bash -c '"$@" >/dev/null 2>&1; "$0" reparar >/dev/null 2>&1' "$(realpath "$0")" \
+        xfreerdp3 ${RDP_FLAGS//+home-drive/} /u:"$RDP_USER" /p:"$RDP_PASS" /title:"Windows" \
+        /wm-class:"WindowsEscritorio" /dynamic-resolution /size:1900x1000 /v:127.0.0.1:3389 \
+        </dev/null 7>&- 8>&- 9>&-
+}
+
+# ----- estado y apagado automático -----------------------------------------------
+
+mostrar_estado() {
+    local e n ram desde
+    e="$(estado)"
+    case "$e" in
+        encendido|arrancando|pausado)
+            n="$(apps_abiertas)"; ram="$(ram_mib)"
+            desde="$(docker inspect -f '{{.State.StartedAt}}' "$CONTENEDOR" | cut -c1-19)"
+            desde="$(date -d "${desde}Z" '+%H:%M' 2>/dev/null)"
+            echo "Windows: $e (desde las $desde)"
+            echo "RAM:     ${ram} MiB"
+            cpu_pct >/dev/null; sleep 1; echo "CPU:     $(cpu_pct) %"
+            echo "Apps:    $n abierta(s)"
+            [ "$n" -gt 0 ] && mostrar_apps ;;
+        *) echo "Windows: $e" ;;
+    esac
+    if [ "$AUTO_APAGADO" -gt 0 ] 2>/dev/null; then
+        echo "Auto:    se apaga tras $AUTO_APAGADO min sin apps abiertas"
+    else
+        echo "Auto:    apagado automático desactivado"
+    fi
+}
+
+# salida para el complemento de GlassPad:
+#   "<estado> <ram_mib> <apps> <auto_min> <agente_ok> <cpu_%>", una línea "PROCESO|nombre" por app
+#   y una línea "ventana|título" por ventana visible
+estado_corto() {
+    local e apps ram=0 cpu=0 ok=1; e="$(estado)"; apps="$(lista_apps)"
+    case "$e" in encendido|arrancando|pausado|apagando|reiniciando)
+        prendido && { ram="$(ram_mib)"; cpu="$(cpu_pct)"; } ;; esac
+    conexion_viva && [ -f "$ABIERTAS" ] && ! agente_responde && ok=0
+    echo "$e ${ram:-0} $(grep -c . <<<"$apps") $AUTO_APAGADO $ok ${cpu:-0}"
+    [ -n "$apps" ] && echo "$apps"
+    conexion_viva && ventanas | sed 's/^/ventana|/'
+    return 0
+}
+
+configurar_auto() {
+    local min="${1:-}"
+    local unidad="$HOME/.config/systemd/user"
+    if [ -z "$min" ]; then mostrar_estado | grep '^Auto'; return; fi
+    [ "$min" = off ] && min=0
+    [[ "$min" =~ ^[0-9]+$ ]] || error "Uso: win auto <minutos>|off"
+    touch "$CONF"
+    if grep -q '^AUTO_APAGADO=' "$CONF"; then sed -i "s/^AUTO_APAGADO=.*/AUTO_APAGADO=$min/" "$CONF"
+    else echo "AUTO_APAGADO=$min" >>"$CONF"; fi
+    if [ "$min" -gt 0 ]; then
+        mkdir -p "$unidad"
+        cat >"$unidad/win-auto.service" <<EOF
+[Unit]
+Description=Apaga Windows (WinApps) si no se usa
+
+[Service]
+Type=oneshot
+ExecStart=$HOME/.local/bin/win _revisar
+EOF
+        cat >"$unidad/win-auto.timer" <<EOF
+[Unit]
+Description=Revisa cada 2 minutos si Windows (WinApps) está en uso
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+
+[Install]
+WantedBy=timers.target
+EOF
+        systemctl --user daemon-reload
+        systemctl --user enable --now win-auto.timer >/dev/null 2>&1
+        marcar_uso
+        echo "Windows se apagará solo tras $min min sin aplicaciones abiertas."
+    else
+        systemctl --user disable --now win-auto.timer >/dev/null 2>&1
+        echo "Apagado automático desactivado."
+    fi
+}
+
+revisar() {
+    [ "$AUTO_APAGADO" -gt 0 ] 2>/dev/null || exit 0
+    [ "$(estado_docker)" = running ] || exit 0
+    orden_en_curso >/dev/null && exit 0
+    if [ "$(apps_abiertas)" -gt 0 ]; then marcar_uso; exit 0; fi
+    [ -f "$ULTIMO_USO" ] || { marcar_uso; exit 0; }
+    local inactivo=$(( ($(date +%s) - $(cat "$ULTIMO_USO")) / 60 ))
+    if [ "$inactivo" -ge "$AUTO_APAGADO" ]; then
+        exclusiva apagando apagar_ahora 0
+    fi
+}
+
+ver_registro() {
+    local n="${1:-25}"
+    echo "== win.log (Linux) =="; tail -n "$n" "$REGISTRO" 2>/dev/null
+    echo; echo "== agente.log (Windows) =="; tail -n "$n" "$ESTADO_DIR/agente.log" 2>/dev/null
+    if [ -f "$ESTADO_DIR/agente-anterior.txt" ]; then
+        echo; echo "== último paso del agente en la sesión anterior =="
+        sed 's/^\xEF\xBB\xBF//; s/\r$//' "$ESTADO_DIR/agente-anterior.txt"
+    fi
+    echo; echo "== freerdp.log (avisos y errores) =="
+    grep -E 'ERROR|WARN' "$REGISTRO_RDP" 2>/dev/null | grep -vE 'Kerberos|keycode|credential|verify_cb|xf_Pointer' | tail -n "$n"
+    echo; echo "Estado: $(estado) · conexión: $(conexion_pid || echo ninguna) · agente: $(agente_responde && echo responde || echo 'sin señales')"
+}
+
+elegir_cliente() {
+    local c="${1:-}"
+    if [ -z "$c" ]; then echo "Cliente para las apps sueltas: $CLIENTE_RDP"; return; fi
+    case "$c" in
+        freerdp) ;;
+        thincast) flatpak info --user "$THINCAST" >/dev/null 2>&1 || flatpak info "$THINCAST" >/dev/null 2>&1 ||
+                      error "Thincast no está instalado (flatpak install --user flathub $THINCAST)."
+                  # Wayland nativo (COSMIC maneja las ventanas) y acceso a la carpeta del agente
+                  flatpak override --user --socket=wayland --filesystem="$ESTADO_DIR" "$THINCAST" ;;
+        *) error "Uso: win cliente freerdp|thincast" ;;
+    esac
+    conexion_viva && error "Cierra primero las apps de Windows abiertas; el cambio aplica a la próxima sesión."
+    touch "$CONF"
+    if grep -q '^CLIENTE_RDP=' "$CONF"; then sed -i "s/^CLIENTE_RDP=.*/CLIENTE_RDP=$c/" "$CONF"
+    else echo "CLIENTE_RDP=$c" >>"$CONF"; fi
+    avisar "Cliente para las apps sueltas: $c"
+}
+
+ayuda() {
+    cat <<'EOF'
+Uso: win <comando>
+
+  win                    estado (igual que: win status)
+  win on                 enciende Windows y espera a que esté listo
+  win off [-f]           cierra las apps (preguntan si guardar) y apaga; -f fuerza
+  win restart [-f]       igual, pero reinicia
+  win excel [archivo]    abre Excel (enciende Windows si hace falta)
+  win word  [archivo]    abre Word
+  win ppt   [archivo]    abre PowerPoint
+  win apps               apps de Windows abiertas
+  win cerrar [-f] <app>  cierra una app (p. ej. EXCEL); -f fuerza sin guardar
+  win cerrar [-f] todas  cierra todas las apps
+  win maximizar <app>    maximiza la ventana de una app (p. ej. WINWORD)
+  win escritorio         escritorio completo de Windows (al cerrarlo se reinicia)
+  win rescatar           si las ventanas quedaron congeladas: abre el escritorio completo
+                         con tus apps tal como estaban, para guardar (sin perder nada)
+  win reparar            reinicia Windows si algo quedó trabado (cierra sin guardar)
+  win auto <min>|off     apaga Windows tras <min> minutos sin apps abiertas
+  win cliente [freerdp|thincast]  cliente RDP de las apps sueltas (thincast: más estable;
+                         las ventanas se mueven con Super + arrastrar)
+  win log [n]            registro de win, del agente y de FreeRDP (últimas n líneas)
+  win logs               registros del contenedor en vivo
+EOF
+}
+
+cmd="${1:-status}"; shift 2>/dev/null || true
+case "$cmd" in _corto|_ventanas|_revisar|status|estado|apps|log|help|-h|--help|ayuda) ;; *) registrar "orden: $cmd $*" ;; esac
+case "$cmd" in
+    on|start|encender) encender ;;
+    off|stop|apagar) apagar "${1:-}" ;;
+    restart|reiniciar) reiniciar "${1:-}" ;;
+    status|estado) mostrar_estado ;;
+    apps) mostrar_apps ;;
+    escritorio|windows|desktop) escritorio ;;
+    reparar|fix) reparar ;;
+    rescatar) rescatar ;;
+    cliente) elegir_cliente "${1:-}" ;;
+    cerrar|kill) cerrar_apps "$@" ;;
+    maximizar|max) maximizar "${1:-}" ;;
+    _corto) estado_corto ;;
+    _revisar) revisar ;;
+    _vigilar) vigilar "$@" ;;
+    _ventanas) ventanas ;;
+    auto) configurar_auto "${1:-}" ;;
+    log|registro) ver_registro "${1:-25}" ;;
+    logs) exec docker logs -f --tail 30 "$CONTENEDOR" ;;
+    help|-h|--help|ayuda) ayuda ;;
+    *)
+        if [ -n "${APPS[$cmd]:-}" ]; then
+            abrir "${APPS[$cmd]}" "$@"
+        else
+            echo "Comando desconocido: $cmd"; echo; ayuda; exit 1
+        fi ;;
+esac
