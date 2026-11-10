@@ -4,6 +4,22 @@ Comando `win` para encender, apagar y usar el Windows de [WinApps](https://githu
 
 La idea: Windows solo ocupa RAM mientras lo usas. Al abrir Word, Excel o PowerPoint desde el menú, `win` lo enciende y espera a que esté listo; cuando no lo usas, lo apagas con `win off` o dejas que se apague solo.
 
+## Capturas
+
+Complemento de la ScreenPad (GlassPad), con tres páginas que se cambian deslizando el dedo:
+
+| Lanzador | Ventanas | Windows |
+|---|---|---|
+| ![Lanzador](docs/capturas/lanzador.png) | ![Ventanas abiertas](docs/capturas/ventanas.png) | ![Control de Windows](docs/capturas/windows.png) |
+
+Con apps extra elegidas en la instalación, el Lanzador pasa a una grilla:
+
+![Lanzador con apps extra](docs/capturas/lanzador-apps-extra.png)
+
+Sin ScreenPad, lo mismo está como **Panel de Windows**, una ventana normal del menú:
+
+![Panel de Windows](docs/capturas/panel-ventana.png)
+
 ## Instalación desde cero
 
 ```sh
@@ -22,7 +38,7 @@ El instalador pregunta y luego hace todo solo, menos activar Office:
 
 Después instala los paquetes (pide sudo: pacman, apt, dnf o zypper), crea el contenedor de Windows (dockur/windows, con los archivos de preparación de WinApps), instala Office con la Office Deployment Tool durante la instalación de Windows, y deja `win`, los accesos del menú y el complemento de GlassPad. Tarda de 30 a 60 minutos sin intervención.
 
-**Lo único manual:** abrir Word e iniciar sesión con tu cuenta de Microsoft 365 para activar la licencia. Windows queda sin activar.
+**Lo único manual:** abrir Word e iniciar sesión con tu cuenta de Microsoft 365 para activar la licencia. La activación de Windows queda a cargo de cada usuario, con su propia licencia.
 
 `./instalar-todo.sh --simular` hace las preguntas y genera la configuración en una carpeta temporal sin instalar nada.
 
@@ -117,6 +133,17 @@ Página **Windows** en la ScreenPad, con tres secciones que se cambian deslizand
 CPU y RAM se leen del cgroup del contenedor (`/sys/fs/cgroup`), sin `docker stats`: la consulta de estado tarda ~0,2 s.
 
 `win` no muestra notificaciones de progreso: el avance se ve en la ScreenPad. Solo un error al abrir desde el menú o desde un archivo aparece unos segundos como notificación.
+
+## Panel de Windows (sin ScreenPad)
+
+`win panel` (o "Panel de Windows" en el menú, si se eligió al instalar) abre el mismo complemento en una ventana: estado, CPU y RAM, apps abiertas con Maximizar y Cerrar, y los botones Encender, Apagar, Reiniciar, Escritorio, Rescatar y Reparar. Las páginas se cambian con las pestañas, las flechas del teclado o deslizando en el touchpad. Para activarlo o quitarlo después: `PANEL=1` o `PANEL=0` en `~/.config/winapps/win.conf` y `win _accesos`.
+
+## Avisos
+
+- Necesitas tus propias licencias de Windows y de Microsoft 365. Este proyecto no incluye, descarga ni activa ninguna licencia; Office se activa iniciando sesión con tu cuenta.
+- Microsoft, Windows, Office, Word, Excel, PowerPoint, Outlook, OneNote y Access son marcas de Microsoft. Este proyecto no está afiliado a Microsoft.
+- [WinApps](https://github.com/winapps-org/winapps) y [dockur/windows](https://github.com/dockur/windows) se descargan durante la instalación con sus propias licencias; este repositorio no incluye su código. Los íconos de las apps de Office vienen de WinApps.
+- [Thincast Remote Desktop Client](https://www.thincast.com/en/products/client) es software de terceros con sus propios términos de uso.
 
 ## Licencia
 

@@ -107,6 +107,16 @@ for clave in $EXTRA_OFFICE; do
     OFFICE_APPS="$OFFICE_APPS $(catalogo | awk -F'|' -v c="$clave" '$1 == c { print $5 }')"
 done
 
+paso "Panel de Windows"
+if [ -d "$HOME/.local/share/glasspad" ] || command -v glasspad-launcher >/dev/null; then
+    info "Tienes GlassPad: el panel ya está en la ScreenPad (página Windows)."
+    PANEL_DEF=n
+else
+    PANEL_DEF=s
+fi
+PANEL=0
+[ "$(preguntar "¿Agregar también el Panel de Windows al menú? (ventana con estado, apps y botones) (s/n)" "$PANEL_DEF")" = s ] && PANEL=1
+
 paso "Recursos para Windows"
 RAM_TOTAL_GB=$(( $(awk '/MemTotal/ { print $2 }' /proc/meminfo) / 1048576 ))
 RAM_DEF=$(( RAM_TOTAL_GB * 2 / 5 )); [ "$RAM_DEF" -gt 6 ] && RAM_DEF=6; [ "$RAM_DEF" -lt 4 ] && RAM_DEF=4
@@ -218,6 +228,7 @@ paso "Resumen"
 info "Cliente:        $CLIENTE"
 info "Office:         $OFFICE_APPS ($PRODUCTO)"
 info "Apps en menú:   $APPS_ELEGIDAS"
+info "Panel en menú:  $([ "$PANEL" = 1 ] && echo sí || echo no)"
 info "Windows:        ${RAM_GB} GB de RAM, $NUCLEOS núcleos, disco de hasta 64 GB"
 info "ISO:            ${ISO:-descargar de Microsoft}"
 info "Región/teclado: $REGION / $TECLADO"
@@ -288,6 +299,7 @@ OFFICE_APPS="$OFFICE_APPS"
 OFFICE_PRODUCTO="$PRODUCTO"
 CLIENTE_RDP=$CLIENTE
 AUTO_APAGADO=0
+PANEL=$PANEL
 EOF
 umask 022
 

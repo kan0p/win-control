@@ -46,6 +46,7 @@ THINCAST="com.thincast.client"
 APPS_ELEGIDAS="word excel ppt"          # apps del catálogo con acceso en el menú y la ScreenPad
 OFFICE_APPS="Word Excel PowerPoint"      # apps de Office instaladas en Windows
 OFFICE_PRODUCTO="O365BusinessRetail"     # O365ProPlusRetail para E3/E5/A3/A5
+PANEL=0                                  # 1: "Panel de Windows" en el menú (sin ScreenPad)
 # shellcheck disable=SC1090
 [ -f "$CONF" ] && . "$CONF"
 
@@ -825,6 +826,21 @@ accesos() {
     for clave in $APPS_ELEGIDAS; do
         [ -n "$(app_dato "$clave" 4)" ] && crear_acceso "$clave"
     done
+    if [ "$PANEL" = 1 ]; then
+        cat >"$ACCESOS/win-panel.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Panel de Windows
+Comment=Encender, apagar y abrir las apps de Windows
+Exec=$HOME/.local/bin/win panel
+Icon=$RAIZ/glasspad/windows/icono.svg
+Terminal=false
+Categories=System;Utility;
+StartupWMClass=io.github.kan0p.WinControl.Panel
+EOF
+    else
+        rm -f "$ACCESOS/win-panel.desktop"
+    fi
     command -v update-desktop-database >/dev/null && update-desktop-database "$ACCESOS" 2>/dev/null
     return 0
 }
@@ -915,6 +931,7 @@ Uso: win <comando>
   win auto <min>|off     apaga Windows tras <min> minutos sin apps abiertas
   win cliente [freerdp|thincast]  cliente RDP de las apps sueltas (thincast: más estable;
                          las ventanas se mueven con Super + arrastrar)
+  win panel              ventana con el estado, las apps y los botones (sin ScreenPad)
   win log [n]            registro de win, del agente y de FreeRDP (últimas n líneas)
   win logs               registros del contenedor en vivo
 EOF
@@ -939,6 +956,7 @@ case "$cmd" in
     _vigilar) vigilar "$@" ;;
     _ventanas) ventanas ;;
     _lanzador) lanzador ;;
+    panel) setsid -f python3 -I "$RAIZ/panel.py" </dev/null >/dev/null 2>&1 ;;
     _accesos) accesos ;;
     apps-disponibles|disponibles) apps_disponibles ;;
     agregar-app|agregar) agregar_app "$@" ;;
