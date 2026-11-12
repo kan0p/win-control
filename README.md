@@ -17,6 +17,7 @@ Complemento de la ScreenPad (GlassPad), con tres páginas que se cambian desliza
 - WinApps instalado para el usuario (`setup.sh --user`) con `WAFLAVOR="docker"`.
 - Contenedor llamado `WinApps` (el `compose.yaml` de WinApps ya lo nombra así).
 - Usuario en el grupo `docker`.
+- Para `win presentar`: `sdl-freerdp3` (viene en el paquete `freerdp` 3) y, para compilar el arreglo de pantalla completa, `gcc` y SDL3 con sus cabeceras.
 - Opcional: GlassPad 0.9.1 o posterior para el complemento.
 
 ## Instalación
@@ -27,7 +28,7 @@ cd win-control
 ./install.sh
 ```
 
-No usa root. Crea un enlace `~/.local/bin/win`, hace que los accesos de Word, Excel, PowerPoint y el escritorio de Windows del menú pasen por `win`, agrega `-gfx` a `RDP_FLAGS` en `winapps.conf` y, si GlassPad está instalado, agrega el complemento **Windows**.
+No usa root. Crea un enlace `~/.local/bin/win`, hace que los accesos de Word, Excel, PowerPoint y el escritorio de Windows del menú pasen por `win`, agrega `-gfx` a `RDP_FLAGS` en `winapps.conf`, compila `sdl/pantalla-completa.c` en `~/.local/lib/win-control/` y, si GlassPad está instalado, agrega el complemento **Windows**.
 
 Desinstalar: `./install.sh --desinstalar`
 
@@ -45,7 +46,11 @@ win apps               apps de Windows abiertas
 win cerrar [-f] <app>  cierra una app (p. ej. EXCEL); -f fuerza sin guardar
 win cerrar [-f] todas  cierra todas las apps
 win maximizar <app>    maximiza la ventana de una app (p. ej. WINWORD)
-win escritorio         escritorio completo de Windows (al cerrarlo se reinicia)
+win presentar          escritorio a pantalla completa en el notebook y, si está extendido, el
+                       proyector (vista del moderador de PowerPoint); el lanzador abre las apps dentro
+win escritorio         escritorio de Windows en una ventana (al cerrarlo se reinicia)
+win desconectar        cierra el escritorio abierto; Windows se reinicia
+win rescatar           si las ventanas se congelaron: escritorio sobre tu sesión, sin perder nada
 win reparar            reinicia Windows si algo quedó trabado
 win auto <min>|off     apaga Windows tras <min> minutos sin apps abiertas
 win log [n]            registro de win, del agente y de FreeRDP (últimas n líneas)
@@ -69,6 +74,20 @@ Con Windows 11 24H2 y FreeRDP 3, una sesión RemoteApp a la que se reconecta ya 
 Mientras abre, la notificación "Abriendo Excel…" se queda hasta que la ventana aparece (`ventanas.py` lee las ventanas de XWayland), y en la ScreenPad el mosaico muestra una ruedita con la etapa.
 
 El escritorio completo deja la sesión en un estado que rompe RemoteApp, por eso `win escritorio` reinicia Windows al cerrarse. Si algo queda trabado, `win reparar` cierra todo y reinicia Windows.
+
+### Escritorio a pantalla completa y presentaciones
+
+Las apps sueltas usan solo la pantalla principal (`/monitors:0` en Thincast): con un proyector extendido, Thincast en Wayland calcula mal las posiciones y las ventanas saltan y no reciben clics. Por eso no conviene arrastrarlas a otra pantalla.
+
+Para presentar con la vista del moderador de PowerPoint está `win presentar` (el botón **Escritorio** del complemento):
+
+- Abre el escritorio completo con `sdl-freerdp3` en Wayland nativo, una ventana a pantalla completa por pantalla: el notebook y cada pantalla extendida, menos la ScreenPad. Con el proyector duplicado o sin proyector, usa solo el notebook. xfreerdp3 no sirve para esto: en XWayland dibuja todo en una sola ventana, que COSMIC muestra en una sola pantalla.
+- Antes de abrir, acomoda las pantallas con `cosmic-randr` para que no se traslapen (FreeRDP las rechaza).
+- `sdl/pantalla-completa.c` (cargado con `LD_PRELOAD`): FreeRDP pide pantalla completa antes de mostrar cada ventana y COSMIC, en ese momento, ignora en qué pantalla va; la librería repite el pedido cuando la ventana ya está visible.
+- Va sin `-gfx` (con él, SDL no dibuja nada) y con `FREERDP_WLROOTS_HACK=force` (sin él, en COSMIC lee 64×64 como tamaño de pantalla).
+- El agente también corre ahí, en modo escritorio (no cierra la sesión): lo arranca un acceso directo de Inicio de Windows que crea el agente de las apps sueltas la primera vez. Con el escritorio abierto, `win word`, `win excel`, `win ppt`, la página Ventanas, cerrar y maximizar funcionan dentro de él. Usa su propia carpeta, `~/.local/state/win/escritorio`.
+- Las pantallas se leen al abrir: conecta el proyector antes. Si lo cambias con el escritorio abierto, desconecta y vuelve a abrirlo.
+- Se cierra con `win desconectar` (o cerrando sesión en Windows); igual que el escritorio en ventana, al cerrarse reinicia Windows.
 
 ### Agregar más apps de Windows
 
@@ -105,7 +124,7 @@ Página **Windows** en la ScreenPad, con tres secciones que se cambian deslizand
 
 - **Lanzador**: Word, Excel y PowerPoint en grande. Si Windows está apagado, lo enciende. Mientras abre, el mosaico muestra una ruedita con la etapa hasta que la ventana aparece de verdad.
 - **Ventanas**: apps abiertas con **Maximizar** y **Cerrar** (un toque cierra normal y Windows pregunta si guardar; dos toques preguntan si forzar).
-- **Windows**: CPU, RAM y apps abiertas; **Encender**, **Apagar**, **Reiniciar** (un toque cierra las apps de forma normal; dos toques preguntan si forzar), **Escritorio**, **Rescatar** (si las ventanas se congelan, abre el escritorio sobre tu sesión sin perder nada) y **Reparar** (reinicia Windows, pide confirmación); y el apagado automático. Mientras una orden está en curso no se puede repetir.
+- **Windows**: CPU, RAM y apps abiertas; **Encender**, **Apagar**, **Reiniciar** (un toque cierra las apps de forma normal; dos toques preguntan si forzar), **Escritorio** (abre `win presentar`; con el escritorio abierto pasa a **Desconectar**), **Rescatar** (si las ventanas se congelan, abre el escritorio sobre tu sesión sin perder nada) y **Reparar** (reinicia Windows, pide confirmación); y el apagado automático. Mientras una orden está en curso no se puede repetir.
 
 CPU y RAM se leen del cgroup del contenedor (`/sys/fs/cgroup`), sin `docker stats`: la consulta de estado tarda ~0,2 s.
 

@@ -9,6 +9,7 @@ COMPLEMENTO="$HOME/.local/share/glasspad/complementos/windows"
 ESCRITORIO="$HOME/.local/share/applications"
 UNIDADES="$HOME/.config/systemd/user"
 APPS=(excel-o365 word-o365 powerpoint-o365)
+LIB="$HOME/.local/lib/win-control"
 
 reiniciar_launcher() {
     systemctl --user try-restart glasspad-launcher.service 2>/dev/null || true
@@ -19,7 +20,7 @@ if [ "${1:-}" = "--desinstalar" ]; then
     rm -f "$UNIDADES/win-auto.service" "$UNIDADES/win-auto.timer"
     systemctl --user daemon-reload
     rm -f "$BIN/win"
-    rm -rf "$COMPLEMENTO"
+    rm -rf "$COMPLEMENTO" "$LIB"
     for a in "${APPS[@]}"; do
         f="$ESCRITORIO/$a.desktop"
         [ -f "$f" ] && sed -i "s|^Exec=$BIN/win $a |Exec=$BIN/winapps $a |" "$f"
@@ -58,6 +59,18 @@ CONF_WINAPPS="$HOME/.config/winapps/winapps.conf"
 if [ -f "$CONF_WINAPPS" ] && ! grep -qE '^RDP_FLAGS=.*-gfx' "$CONF_WINAPPS"; then
     sed -i -E 's|^(RDP_FLAGS="[^"]*)"|\1 -gfx"|' "$CONF_WINAPPS"
     echo "winapps.conf: agregado -gfx a RDP_FLAGS"
+fi
+
+# arreglo para win presentar en COSMIC: sin él, todas las ventanas de sdl-freerdp3 quedan en la
+# pantalla principal (ver sdl/pantalla-completa.c)
+if command -v gcc >/dev/null && pkg-config --exists sdl3 2>/dev/null; then
+    mkdir -p "$LIB"
+    gcc -O2 -shared -fPIC -o "$LIB/pantalla-completa.so" "$DIR/sdl/pantalla-completa.c" \
+        $(pkg-config --cflags sdl3) -ldl
+    echo "arreglo de pantalla completa -> $LIB/pantalla-completa.so"
+else
+    echo "Aviso: sin gcc o sin sdl3 (pkg-config) no se compila sdl/pantalla-completa.c;" \
+         "win presentar en varias pantallas puede dejar todo en la principal." >&2
 fi
 
 if [ -d "$HOME/.local/share/glasspad" ] || command -v glasspad-launcher >/dev/null; then
