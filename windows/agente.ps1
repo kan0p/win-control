@@ -80,6 +80,10 @@ function Salir {
 
 New-Item -ItemType Directory -Path $cola -Force | Out-Null
 
+# en el escritorio también se informan las apps de Office abiertas desde Inicio, no solo las
+# que pidió el lanzador
+if ($Escritorio) { $nombres['WINWORD'] = 'Word'; $nombres['EXCEL'] = 'Excel'; $nombres['POWERPNT'] = 'PowerPoint' }
+
 # host.lan (Samba del contenedor, tu carpeta personal) como intranet local: sin esto Windows lo trata
 # como internet, Office abre los archivos en Vista protegida y bloquea las macros
 $zona = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings\ZoneMap\Domains\host.lan'

@@ -92,10 +92,11 @@ notificar_app() {
 }
 
 # títulos de las ventanas visibles de la sesión: "Libro1 - Excel", "Word"…
-# con Thincast en Wayland las ventanas no son de X11: los títulos los informa el agente
+# con Thincast en Wayland (y en el escritorio de presentar) los títulos los informa el agente
 ventanas() {
-    if [ "$CLIENTE_RDP" = thincast ]; then
-        conexion_viva && [ -f "$ABIERTAS" ] && sed -n 's/^\xEF\xBB\xBF//; s/\r$//; s/^v|//p' "$ABIERTAS"
+    if presentar_abierto || [ "$CLIENTE_RDP" = thincast ]; then
+        local f; f="$(abiertas_actual)"
+        [ -n "$f" ] && sed -n 's/^\xEF\xBB\xBF//; s/\r$//; s/^v|//p' "$f"
         return 0
     fi
     python3 -I "$VENTANAS" 2>/dev/null
@@ -266,9 +267,19 @@ agente_responde() {
 }
 
 # "proceso|nombre" por app abierta
+# archivo de apps abiertas que vale ahora: el del escritorio de presentar o el de las apps sueltas
+abiertas_actual() {
+    if presentar_abierto; then
+        [ -f "$ESC_DIR/abiertas.txt" ] && echo "$ESC_DIR/abiertas.txt"
+    else
+        conexion_viva && [ -f "$ABIERTAS" ] && echo "$ABIERTAS"
+    fi
+}
+
 lista_apps() {
-    conexion_viva && [ -f "$ABIERTAS" ] || return 0
-    sed 's/^\xEF\xBB\xBF//; s/\r$//' "$ABIERTAS" | grep '|' | grep -v '^v|' || true
+    local f; f="$(abiertas_actual)" || return 0
+    [ -n "$f" ] || return 0
+    sed 's/^\xEF\xBB\xBF//; s/\r$//' "$f" | grep '|' | grep -v '^v|' || true
 }
 
 apps_abiertas() {
@@ -453,6 +464,11 @@ cerrar_todo_forzado() {
 
 maximizar() {
     [ -n "${1:-}" ] || error "Uso: win maximizar <app>   (los nombres salen en: win apps)"
+    if presentar_abierto; then
+        agente_escritorio_vivo || error "El agente del escritorio de Windows no responde."
+        COLA_PEDIDOS="$ESC_DIR/cola" pedir maximizar "${1^^}"
+        return 0
+    fi
     conexion_viva && agente_responde || error "No hay apps de Windows abiertas o el agente no responde."
     pedir maximizar "${1^^}"
 }
@@ -463,6 +479,18 @@ cerrar_apps() {
         case "$a" in -f|--forzar) forzar=1 ;; *) objetivo="$a" ;; esac
     done
     [ -n "$objetivo" ] || error "Uso: win cerrar [-f] <app>|todas   (los nombres salen en: win apps)"
+    # escritorio de presentar: los pedidos van a su agente; la sesión la cierra Desconectar
+    if presentar_abierto; then
+        agente_escritorio_vivo || error "El agente del escritorio de Windows no responde."
+        local accion=cerrar p; [ "$forzar" -eq 1 ] && accion=forzar
+        if [ "$objetivo" = todas ]; then
+            for p in $(lista_apps | cut -d'|' -f1); do COLA_PEDIDOS="$ESC_DIR/cola" pedir "$accion" "$p"; done
+        else
+            COLA_PEDIDOS="$ESC_DIR/cola" pedir "$accion" "${objetivo^^}"
+        fi
+        avisar "Cerrando en el escritorio de Windows…"
+        return 0
+    fi
     conexion_viva || { avisar "No hay apps de Windows abiertas."; return 0; }
     if [ "$objetivo" = todas ]; then
         if [ "$forzar" -eq 1 ]; then
@@ -625,13 +653,18 @@ rescatar() {
 # sin él, en COSMIC lee 64x64 como tamaño de pantalla y no conecta
 sdl_rdp() { FREERDP_WLROOTS_HACK=force SDL_VIDEODRIVER=wayland sdl-freerdp3 "$@"; }
 
-# ids de SDL de las pantallas para presentar: todas menos la ScreenPad
-# (los ids cambian en cada arranque de sesión: se leen siempre por nombre)
+# ids de SDL de las pantallas para presentar: las extendidas menos la ScreenPad. Una pantalla
+# duplicada (proyector en espejo) SDL la lista igual, encima de la principal, y FreeRDP rechaza
+# pantallas traslapadas: solo cuentan las que xrandr muestra como monitor aparte.
+# (los ids de SDL cambian en cada arranque de sesión: se leen siempre por nombre)
 monitores_presentar() {
     [ -n "${WIN_MONITORES:-}" ] && { echo "$WIN_MONITORES"; return; }
-    sdl_rdp /list:monitor 2>/dev/null | awk -v sp="$SALIDA_SCREENPAD" '
+    local extendidas
+    extendidas=" $(xrandr --listmonitors 2>/dev/null | awk '/^ *[0-9]+:/ { printf "%s ", $NF }')"
+    sdl_rdp /list:monitor 2>/dev/null | awk -v sp="$SALIDA_SCREENPAD" -v ext="$extendidas" '
         /\[[0-9]+\]/ { match($0, /\[[0-9]+\]/); i = substr($0, RSTART + 1, RLENGTH - 2)
-                       if (index($0, " - " sp "]") || index($0, "[" sp "]")) next
+                       n = $0; sub(/\][^]]*$/, "", n); sub(/.*[[ ]/, "", n)
+                       if (n == sp || !index(ext, " " n " ")) next
                        l = l (l == "" ? "" : ",") i }
         END { print l }'
 }
@@ -663,7 +696,8 @@ presentar() {
     local mons
     acomodar_pantallas
     mons="$(monitores_presentar)"
-    [[ "$mons" == *,* ]] || error "No veo el proyector como pantalla extendida. Conéctalo y elige «Extender» en Ajustes > Pantallas."
+    # una sola pantalla (sin proyector o duplicado): pantalla completa en el notebook
+    [ -n "$mons" ] || error "No encontré pantallas para el escritorio de Windows."
     escritorio "$mons"
 }
 
@@ -752,7 +786,7 @@ estado_corto() {
     local esc=0; escritorio_abierto && esc=1
     echo "$e ${ram:-0} $(grep -c . <<<"$apps") $AUTO_APAGADO $ok ${cpu:-0} $esc"
     [ -n "$apps" ] && echo "$apps"
-    conexion_viva && ventanas | sed 's/^/ventana|/'
+    { conexion_viva || presentar_abierto; } && ventanas | sed 's/^/ventana|/'
     return 0
 }
 
@@ -800,7 +834,8 @@ revisar() {
     [ "$AUTO_APAGADO" -gt 0 ] 2>/dev/null || exit 0
     [ "$(estado_docker)" = running ] || exit 0
     orden_en_curso >/dev/null && exit 0
-    if [ "$(apps_abiertas)" -gt 0 ]; then marcar_uso; exit 0; fi
+    # un escritorio abierto cuenta como en uso aunque no tenga apps de Office
+    if [ "$(apps_abiertas)" -gt 0 ] || escritorio_abierto; then marcar_uso; exit 0; fi
     [ -f "$ULTIMO_USO" ] || { marcar_uso; exit 0; }
     local inactivo=$(( ($(date +%s) - $(cat "$ULTIMO_USO")) / 60 ))
     if [ "$inactivo" -ge "$AUTO_APAGADO" ]; then
@@ -854,10 +889,11 @@ Uso: win <comando>
   win cerrar [-f] <app>  cierra una app (p. ej. EXCEL); -f fuerza sin guardar
   win cerrar [-f] todas  cierra todas las apps
   win maximizar <app>    maximiza la ventana de una app (p. ej. WINWORD)
-  win escritorio         escritorio completo de Windows (al cerrarlo se reinicia)
   win desconectar        cierra el escritorio (normal o de presentar); Windows se reinicia
-  win presentar          escritorio a pantalla completa en notebook + proyector extendido
-                         (vista del moderador de PowerPoint); para salir: barra de arriba
+  win presentar          escritorio a pantalla completa en el notebook y, si está extendido, el
+                         proyector (vista del moderador de PowerPoint); el lanzador abre las apps
+                         dentro; es el botón Escritorio de la ScreenPad
+  win escritorio         escritorio en una ventana (sin el lanzador)
   win rescatar           si las ventanas quedaron congeladas: abre el escritorio completo
                          con tus apps tal como estaban, para guardar (sin perder nada)
   win reparar            reinicia Windows si algo quedó trabado (cierra sin guardar)

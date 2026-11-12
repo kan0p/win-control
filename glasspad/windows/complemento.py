@@ -358,7 +358,7 @@ def crear(api):
         b_escritorio.imagen.set_from_icon_name("network-offline-symbolic" if esc
                                                else "video-display-symbolic")
         clase(b_escritorio, "inactivo", (ocupado_ or apps > 0) and not esc)
-        clase(b_rescatar, "inactivo", apps == 0 or ocupado_)
+        clase(b_rescatar, "inactivo", apps == 0 or ocupado_ or esc)
         clase(b_reparar, "inactivo", not prendido or ocupado_)
         for m, chip in chips.items():
             clase(chip, "elegido", m == auto)
@@ -500,13 +500,15 @@ def crear(api):
             return
         if ocupado():
             return
-        api.avisar("Abriendo el escritorio de Windows…")
+        api.avisar("Abriendo el escritorio de Windows a pantalla completa…")
 
         def listo(ok, salida):
             if not ok:
                 api.avisar(ultima(salida))
             refrescar()
-        correr(["escritorio"], listo)
+        # escritorio a pantalla completa (con proyector extendido, en las dos pantallas) donde el
+        # lanzador abre las apps; el escritorio en ventana queda en «win escritorio»
+        correr(["presentar"], listo)
 
     def rescatar():
         if not estado["apps"]:
