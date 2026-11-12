@@ -32,6 +32,8 @@ VENTANAS="$RAIZ/ventanas.py"
 # el agente usa su propia unidad (\\tsclient\win): la de la carpeta personal puede
 # quedar ocupada mucho rato mientras Office la recorre la primera vez
 AGENTE_LOCAL="$ESTADO_DIR/agente.ps1"
+# escritorio de `win presentar`: su propio agente, cola y estado (unidad \\tsclient\win)
+ESC_DIR="$ESTADO_DIR/escritorio"
 AGENTE_WIN='\\tsclient\win\agente.ps1'
 ESTADO_WIN='\\tsclient\win'
 ESPERA_AGENTE=45        # s para que el agente dé señales tras conectar
@@ -44,6 +46,8 @@ mkdir -p "$ESTADO_DIR"
 AUTO_APAGADO=0
 CLIENTE_RDP=freerdp     # freerdp | thincast (solo para las apps sueltas)
 THINCAST="com.thincast.client"
+SALIDA_SCREENPAD=HDMI-A-4  # salida de la ScreenPad: no se usa al presentar
+ARREGLO_SDL="$HOME/.local/lib/win-control/pantalla-completa.so"  # compilado de sdl/pantalla-completa.c
 # shellcheck disable=SC1090
 [ -f "$CONF" ] && . "$CONF"
 
@@ -227,12 +231,20 @@ conexion_pid() {
 
 conexion_viva() { conexion_pid >/dev/null; }
 
+presentar_abierto() { pgrep -u "$(id -u)" -x sdl-freerdp3 >/dev/null; }
+
+# el agente del escritorio reescribe abiertas.txt cada ~1 s mientras está vivo
+agente_escritorio_vivo() {
+    local f="$ESC_DIR/abiertas.txt"
+    [ -f "$f" ] && [ $(( $(date +%s) - $(stat -c %Y "$f") )) -lt 6 ]
+}
+
 escritorio_abierto() {
     local p
     for p in $(pgrep -u "$(id -u)" -x xfreerdp3); do
         tr '\0' '\n' <"/proc/$p/cmdline" 2>/dev/null | grep -qx '/wm-class:WindowsEscritorio' && return 0
     done
-    return 1
+    pgrep -u "$(id -u)" -x sdl-freerdp3 >/dev/null
 }
 
 # conexiones de win que no son la registrada (p. ej. de una sesión anterior): se eliminan
@@ -283,6 +295,7 @@ hay_pedidos() { compgen -G "$COLA/*.pedido" >/dev/null; }
 
 # encola un pedido para el agente; descarta repetidos (pendientes o de hace < 3 s)
 pedir() {
+    local COLA="${COLA_PEDIDOS:-$COLA}"
     mkdir -p "$COLA"
     local contenido clave ahora k t f
     contenido="$(printf '%s\n' "$@")"
@@ -325,7 +338,9 @@ lanzar_conexion() {
     # shellcheck disable=SC2086
     local cliente=(xfreerdp3)
     # Thincast pregunta por el certificado autofirmado en una ventana; la conexión es solo local
-    [ "$CLIENTE_RDP" = thincast ] && cliente=(flatpak run "$THINCAST" /cert:ignore)
+    # /monitors:0 = solo la pantalla principal: con un proyector extendido (o la ScreenPad)
+    # Thincast en Wayland calcula mal las posiciones y las ventanas saltan y no reciben clics
+    [ "$CLIENTE_RDP" = thincast ] && cliente=(flatpak run "$THINCAST" /cert:ignore /monitors:0)
     registrar "cliente RDP: $CLIENTE_RDP"
     systemd-run --user --scope --quiet --collect --expand-environment=no --unit="win-sesion-$$-$RANDOM" -- \
         setsid -f bash -c 'echo $$ >"$0"; exec "$@" >>"$REGISTRO_RDP" 2>&1' "$PID_CONEXION" \
@@ -542,6 +557,12 @@ abrir() {
             *) notificar_app "$icono" "Encendiendo Windows para abrir $nombre…"; limite=90 ;;
         esac
     fi
+    if presentar_abierto; then
+        agente_escritorio_vivo || error "El escritorio de Windows aún está iniciando (o no responde): espera unos segundos y vuelve a intentar."
+        COLA_PEDIDOS="$ESC_DIR/cola" pedir abrir "$exe" "$nombre" "$archivo"
+        notificar_app "$icono" "Abriendo $nombre en el escritorio de Windows…" 4000
+        return 0
+    fi
     escritorio_abierto && error "Tienes abierto el escritorio de Windows: abre $nombre ahí (tus archivos están en la carpeta Shared) o cierra el escritorio primero."
     encender || exit 1
     en_terminal || notificar_app "$icono" "Abriendo $nombre…"
@@ -599,7 +620,71 @@ rescatar() {
 
 # el escritorio completo deja la sesión en un estado en que RemoteApp no muestra
 # ventanas; al cerrarlo se reinicia Windows para limpiarla
+# el escritorio para presentar usa sdl-freerdp3 en Wayland nativo: una ventana a pantalla
+# completa por cada pantalla (xfreerdp3 en XWayland solo se ve en una). FREERDP_WLROOTS_HACK:
+# sin él, en COSMIC lee 64x64 como tamaño de pantalla y no conecta
+sdl_rdp() { FREERDP_WLROOTS_HACK=force SDL_VIDEODRIVER=wayland sdl-freerdp3 "$@"; }
+
+# ids de SDL de las pantallas para presentar: todas menos la ScreenPad
+# (los ids cambian en cada arranque de sesión: se leen siempre por nombre)
+monitores_presentar() {
+    [ -n "${WIN_MONITORES:-}" ] && { echo "$WIN_MONITORES"; return; }
+    sdl_rdp /list:monitor 2>/dev/null | awk -v sp="$SALIDA_SCREENPAD" '
+        /\[[0-9]+\]/ { match($0, /\[[0-9]+\]/); i = substr($0, RSTART + 1, RLENGTH - 2)
+                       if (index($0, " - " sp "]") || index($0, "[" sp "]")) next
+                       l = l (l == "" ? "" : ",") i }
+        END { print l }'
+}
+
+# escritorio completo en pantalla completa sobre notebook + proyector extendido:
+# PowerPoint muestra la presentación en una y la vista del moderador en la otra
+# xfreerdp3 /multimon rechaza pantallas traslapadas o con huecos (COSMIC suele dejar el
+# proyector 4 px encima del notebook): notebook en 0,0 y cada pantalla externa (menos la
+# ScreenPad) justo a su derecha
+acomodar_pantallas() {
+    command -v cosmic-randr >/dev/null || return 0
+    # solo las pantallas extendidas (las duplicadas no aparecen en xrandr --listmonitors)
+    local kdl ancho extendidas
+    kdl="$(cosmic-randr list --kdl 2>/dev/null)" || return 0
+    extendidas=" $(xrandr --listmonitors 2>/dev/null | awk '/^ *[0-9]+:/ { printf "%s ", $NF }')"
+    ancho="$(xrandr --listmonitors 2>/dev/null | awk '$NF ~ /^eDP/ { split($3, a, "/"); print a[1]; exit }')"
+    [ -n "$ancho" ] || return 0
+    awk -v sp="$SALIDA_SCREENPAD" -v x="$ancho" -v ext="$extendidas" '
+        /^output "/ { n = $2; gsub(/"/, "", n); act = ($0 ~ /enabled=#true/) && index(ext, " " n " ") }
+        /^  position / && act {
+            if (n ~ /^eDP/) $0 = "  position 0 0"
+            else if (n != sp) { $0 = "  position " x " 0"; x += 1920 }
+        }
+        { print }' <<<"$kdl" | cosmic-randr kdl >/dev/null 2>&1
+    sleep 1
+}
+
+presentar() {
+    local mons
+    acomodar_pantallas
+    mons="$(monitores_presentar)"
+    [[ "$mons" == *,* ]] || error "No veo el proyector como pantalla extendida. Conéctalo y elige «Extender» en Ajustes > Pantallas."
+    escritorio "$mons"
+}
+
 escritorio() {
+    local mons="${1:-}" cliente=(xfreerdp3) modo=(/wm-class:"WindowsEscritorio" /dynamic-resolution /size:1900x1000)
+    # registro del cliente: solo el de presentar (el escritorio normal no lo guarda)
+    export WIN_REGISTRO_ESC=/dev/null
+    if [ -n "$mons" ]; then
+        # pantalla-completa.so: COSMIC deja todas las ventanas en la pantalla principal si
+        # SDL pide pantalla completa antes de mostrarlas (ver sdl/pantalla-completa.c)
+        cliente=(env FREERDP_WLROOTS_HACK=force SDL_VIDEODRIVER=wayland)
+        [ -f "$ARREGLO_SDL" ] && cliente+=(LD_PRELOAD="$ARREGLO_SDL")
+        cliente+=(sdl-freerdp3)
+        # unidad \\tsclient\win con el agente: lo arranca el acceso directo de Inicio
+        # (lo instala el agente de las apps sueltas) para que el lanzador abra apps aquí
+        mkdir -p "$ESC_DIR/cola"
+        rm -f "$ESC_DIR"/cola/*.pedido "$ESC_DIR/abiertas.txt"
+        cmp -s "$AGENTE" "$ESC_DIR/agente.ps1" || cp "$AGENTE" "$ESC_DIR/agente.ps1"
+        modo=(/multimon /monitors:"$mons" /drive:win,"$ESC_DIR")
+        WIN_REGISTRO_ESC="$ESTADO_DIR/presentar.log"
+    fi
     [ "$(apps_abiertas)" -gt 0 ] && error "Cierra primero las apps de Windows abiertas (o usa: win cerrar -f todas)."
     encender || exit 1
     matar_huerfanas
@@ -607,15 +692,29 @@ escritorio() {
     local RDP_USER RDP_PASS RDP_FLAGS
     # shellcheck disable=SC1090
     . "$HOME/.config/winapps/winapps.conf"
+    # con -gfx (necesario para las apps sueltas) SDL no dibuja nada: al presentar va con GFX
+    [ -n "$mons" ] && RDP_FLAGS="${RDP_FLAGS//-gfx/}"
     avisar "Abriendo el escritorio de Windows. Tus archivos están en la carpeta Shared del escritorio."
     # escritorio completo sin redirección de unidades (los archivos van por Samba: \\host.lan\Data);
     # al cerrarlo se reinicia Windows para que las apps sueltas vuelvan a funcionar
     # shellcheck disable=SC2086
     systemd-run --user --scope --quiet --collect --expand-environment=no --unit="win-escritorio-$$" -- \
-        setsid -f bash -c '"$@" >/dev/null 2>&1; "$0" reparar >/dev/null 2>&1' "$(realpath "$0")" \
-        xfreerdp3 ${RDP_FLAGS//+home-drive/} /u:"$RDP_USER" /p:"$RDP_PASS" /title:"Windows" \
-        /wm-class:"WindowsEscritorio" /dynamic-resolution /size:1900x1000 /v:127.0.0.1:3389 \
+        setsid -f bash -c '"$@" >"$WIN_REGISTRO_ESC" 2>&1; "$0" reparar >/dev/null 2>&1' "$(realpath "$0")" \
+        "${cliente[@]}" ${RDP_FLAGS//+home-drive/} /u:"$RDP_USER" /p:"$RDP_PASS" /title:"Windows" \
+        "${modo[@]}" /v:127.0.0.1:3389 \
         </dev/null 7>&- 8>&- 9>&-
+}
+
+# cierra el escritorio completo (normal o de presentar): al cerrarse, su lanzador reinicia
+# Windows (win reparar) para que las apps sueltas vuelvan a funcionar
+desconectar() {
+    escritorio_abierto || error "No hay un escritorio de Windows abierto."
+    local p
+    for p in $(pgrep -u "$(id -u)" -x sdl-freerdp3) $(pgrep -u "$(id -u)" -x xfreerdp3); do
+        tr '\0' '\n' <"/proc/$p/cmdline" 2>/dev/null | grep -qE '^/wm-class:Windows$|agente\.ps1' && continue
+        kill "$p" 2>/dev/null
+    done
+    avisar "Escritorio desconectado: Windows se reinicia para dejar listas las apps sueltas (cerca de 1 minuto)."
 }
 
 # ----- estado y apagado automático -----------------------------------------------
@@ -650,7 +749,8 @@ estado_corto() {
     case "$e" in encendido|arrancando|pausado|apagando|reiniciando)
         prendido && { ram="$(ram_mib)"; cpu="$(cpu_pct)"; } ;; esac
     conexion_viva && [ -f "$ABIERTAS" ] && ! agente_responde && ok=0
-    echo "$e ${ram:-0} $(grep -c . <<<"$apps") $AUTO_APAGADO $ok ${cpu:-0}"
+    local esc=0; escritorio_abierto && esc=1
+    echo "$e ${ram:-0} $(grep -c . <<<"$apps") $AUTO_APAGADO $ok ${cpu:-0} $esc"
     [ -n "$apps" ] && echo "$apps"
     conexion_viva && ventanas | sed 's/^/ventana|/'
     return 0
@@ -755,6 +855,9 @@ Uso: win <comando>
   win cerrar [-f] todas  cierra todas las apps
   win maximizar <app>    maximiza la ventana de una app (p. ej. WINWORD)
   win escritorio         escritorio completo de Windows (al cerrarlo se reinicia)
+  win desconectar        cierra el escritorio (normal o de presentar); Windows se reinicia
+  win presentar          escritorio a pantalla completa en notebook + proyector extendido
+                         (vista del moderador de PowerPoint); para salir: barra de arriba
   win rescatar           si las ventanas quedaron congeladas: abre el escritorio completo
                          con tus apps tal como estaban, para guardar (sin perder nada)
   win reparar            reinicia Windows si algo quedó trabado (cierra sin guardar)
@@ -775,8 +878,10 @@ case "$cmd" in
     status|estado) mostrar_estado ;;
     apps) mostrar_apps ;;
     escritorio|windows|desktop) escritorio ;;
+    presentar|proyector) presentar ;;
     reparar|fix) reparar ;;
     rescatar) rescatar ;;
+    desconectar|disconnect) desconectar ;;
     cliente) elegir_cliente "${1:-}" ;;
     cerrar|kill) cerrar_apps "$@" ;;
     maximizar|max) maximizar "${1:-}" ;;

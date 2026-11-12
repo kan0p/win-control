@@ -77,7 +77,7 @@ CSS = """
 
 def crear(api):
     api.css(CSS)
-    estado = {"e": "apagado", "apps": 0, "auto": 0, "agente": True, "orden": False,
+    estado = {"e": "apagado", "apps": 0, "auto": 0, "agente": True, "orden": False, "escritorio": False,
               "ram": 0, "pagina": 0}
     reloj = [0]
     reloj_carga = [0]
@@ -253,9 +253,12 @@ def crear(api):
 
     def boton(texto, icono, al_tocar, columna, fila, clases=()):
         hijo = Gtk.Box(spacing=16, halign=Gtk.Align.CENTER)
-        hijo.append(Gtk.Image(icon_name=icono, pixel_size=40, css_classes=["icono-boton"]))
-        hijo.append(Gtk.Label(label=texto))
+        imagen = Gtk.Image(icon_name=icono, pixel_size=40, css_classes=["icono-boton"])
+        etiqueta = Gtk.Label(label=texto)
+        hijo.append(imagen)
+        hijo.append(etiqueta)
         b = api.accion(Gtk.Button(child=hijo, css_classes=["win-boton", *clases]), al_tocar)
+        b.imagen, b.etiqueta = imagen, etiqueta
         grilla.attach(b, columna, fila, 1, 1)
         return b
 
@@ -324,8 +327,8 @@ def crear(api):
 
     # ----- estado ---------------------------------------------------------------
 
-    def mostrar(e, ram, apps, auto, agente, cpu=0):
-        estado.update(e=e, apps=apps, auto=auto, agente=agente, ram=ram)
+    def mostrar(e, ram, apps, auto, agente, cpu=0, esc=False):
+        estado.update(e=e, apps=apps, auto=auto, agente=agente, ram=ram, escritorio=esc)
         texto_estado.set_label(ESTADOS.get(e, e))
         punto.set_css_classes(["win-punto", e])
         prendido = e in PRENDIDO
@@ -350,7 +353,11 @@ def crear(api):
         clase(b_on, "inactivo", prendido or ocupado_)
         clase(b_off, "inactivo", not prendido or e == "apagando")
         clase(b_reiniciar, "inactivo", not prendido or e in ("apagando", "reiniciando"))
-        clase(b_escritorio, "inactivo", ocupado_ or apps > 0)
+        # con un escritorio abierto el mismo botón lo desconecta
+        b_escritorio.etiqueta.set_label("Desconectar" if esc else "Escritorio")
+        b_escritorio.imagen.set_from_icon_name("network-offline-symbolic" if esc
+                                               else "video-display-symbolic")
+        clase(b_escritorio, "inactivo", (ocupado_ or apps > 0) and not esc)
         clase(b_rescatar, "inactivo", apps == 0 or ocupado_)
         clase(b_reparar, "inactivo", not prendido or ocupado_)
         for m, chip in chips.items():
@@ -387,11 +394,12 @@ def crear(api):
         def listo(ok, salida):
             lineas = salida.splitlines()
             partes = lineas[0].split() if lineas else []
-            if not ok or len(partes) not in (5, 6):
+            if not ok or len(partes) not in (5, 6, 7):
                 return
             e, ram, apps, auto, agente = partes[:5]
-            cpu = int(partes[5]) if len(partes) == 6 and partes[5].isdigit() else 0
-            mostrar(e, int(ram or 0), int(apps or 0), int(auto or 0), agente == "1", cpu)
+            cpu = int(partes[5]) if len(partes) >= 6 and partes[5].isdigit() else 0
+            esc = len(partes) == 7 and partes[6] == "1"
+            mostrar(e, int(ram or 0), int(apps or 0), int(auto or 0), agente == "1", cpu, esc)
             ventanas[:] = [l[8:] for l in lineas[1:] if l.startswith("ventana|")]
             mostrar_abiertas([tuple(l.split("|", 1)) for l in lineas[1:]
                               if "|" in l and not l.startswith("ventana|")])
@@ -481,6 +489,12 @@ def crear(api):
               else "Reiniciando Windows…")
 
     def escritorio():
+        if estado["escritorio"]:
+            preguntar("¿Desconectar el escritorio de Windows? Guarda antes tu trabajo: "
+                      "Windows se reinicia y se pierde lo que no hayas guardado.",
+                      lambda: orden(["desconectar"], "Desconectando el escritorio…"),
+                      "Desconectar")
+            return
         if estado["apps"]:
             api.avisar("Cierra primero las apps abiertas (página Ventanas).")
             return

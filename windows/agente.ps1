@@ -1,7 +1,9 @@
-# agente de win-control: abre y cierra apps dentro de la sesion RemoteApp y la cierra
+﻿# agente de win-control: abre y cierra apps dentro de la sesion RemoteApp y la cierra
 # (logoff) cuando ya no queda ninguna, porque Windows 11 24H2 no restaura RemoteApp al reconectar.
 # kan0p - https://github.com/kan0p/win-control - GPL-3.0-or-later
-param([Parameter(Mandatory = $true)][string]$Dir)
+# -Escritorio: corre dentro del escritorio completo de `win presentar` (lo arranca el acceso
+# directo de Inicio); ahí solo abre apps: no cierra la sesión al quedar sin apps.
+param([Parameter(Mandatory = $true)][string]$Dir, [switch]$Escritorio)
 
 $ErrorActionPreference = 'SilentlyContinue'
 $cola = Join-Path $Dir 'cola'
@@ -90,8 +92,21 @@ if (Test-Path -LiteralPath $ultimoPaso) {
     Set-Content -LiteralPath (Join-Path $Dir 'agente-anterior.txt') -Encoding UTF8 -Value $previo
 }
 if ((Test-Path $localLog) -and (Get-Item $localLog).Length -gt 1MB) { Remove-Item $localLog }
+
+# acceso directo en Inicio para el escritorio de `win presentar`: el Explorador lo ejecuta al
+# iniciar un escritorio completo (las sesiones RemoteApp no lo ejecutan). Solo encuentra el
+# agente si la sesión trae la unidad \\tsclient\win; si no, se rinde al minuto.
+if (-not $Escritorio) {
+    $acceso = Join-Path ([Environment]::GetFolderPath('Startup')) 'win-control escritorio.lnk'
+    $orden = "for(`$i=0; `$i -lt 60; `$i++){ if(Test-Path '\\tsclient\win\agente.ps1'){ & '\\tsclient\win\agente.ps1' -Dir '\\tsclient\win' -Escritorio; break }; Start-Sleep 1 }"
+    $lnk = (New-Object -ComObject WScript.Shell).CreateShortcut($acceso)
+    $lnk.TargetPath = Join-Path $env:WINDIR 'System32\conhost.exe'
+    $lnk.Arguments = "--headless powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command `"$orden`""
+    $lnk.WindowStyle = 7
+    $lnk.Save()
+}
 Add-Type -Name Ventana -Namespace WinControl -MemberDefinition '[DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr h, int n);'
-Log 'inicio'
+Log $(if ($Escritorio) { 'inicio (escritorio)' } else { 'inicio' })
 $vuelta = 0
 
 while ($true) {
@@ -122,6 +137,8 @@ while ($true) {
         $cortadoDesde = $null
     }
 
+    # en el escritorio la sesión la cierra el usuario: el agente solo atiende pedidos
+    if ($Escritorio) { Start-Sleep -Milliseconds 700; continue }
     if ($cortadoDesde -and ($ahora - $cortadoDesde).TotalSeconds -ge $GRACIA_CORTE) { Salir }
     if ($vacioDesde -and ($ahora - $vacioDesde).TotalSeconds -ge $GRACIA_VACIO -and
         ($ahora - $inicio).TotalSeconds -ge $GRACIA_INICIO) {
